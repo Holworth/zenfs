@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "log.h"
 #include "metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
@@ -68,6 +69,19 @@ class ZonedBlockDevice;
 class ZoneSnapshot;
 class ZenFSSnapshotOptions;
 
+class ZoneFile;
+
+// Hint for Zone Allocation
+struct ZoneAllocationHint {};
+struct WALZoneAllocationHint : public ZoneAllocationHint {
+ public:
+  WALZoneAllocationHint() = default;
+  WALZoneAllocationHint(size_t size, ZoneFile *file)
+      : len(size), zone_file(file) {}
+  size_t len;
+  ZoneFile *zone_file;
+};
+
 class Zone {
   ZonedBlockDevice *zbd_;
   std::atomic_bool busy_;
@@ -108,6 +122,11 @@ class Zone {
                                                std::memory_order_acq_rel);
   }
 
+  void LoopForAcquire() {
+    while (!Acquire())
+      ;
+  }
+
   void SetProvisioningFlag(bool flag) { provisioning_zone_ = flag; }
 
   bool IsProvisioningZone() const { return provisioning_zone_; }
@@ -132,11 +151,16 @@ class ZonedBlockDevice {
   // number of total zones.
   uint32_t nr_provisioning_zones_;
   std::vector<Zone *> io_zones;
-  /*
-  std::vector<Zone*> wal_zones_;
-  std::vector<Zone*> key_sst_zones_;
-  std::vector<Zone*> value_sst_zones_;
-  */
+
+  // [kqh] More specific zone allocation
+  std::vector<Zone *> wal_zones_;
+
+  int active_wal_zone_ = kNoActiveWALZone;
+  const static int kNoActiveWALZone = -1;
+
+  std::vector<Zone *> key_sst_zones_;
+  std::vector<Zone *> value_sst_zones_;
+
   std::vector<Zone *> meta_zones;
   // Zones for over-provisioning
   std::vector<Zone *> provisioning_zones;
@@ -183,6 +207,15 @@ class ZonedBlockDevice {
   IOStatus AllocateIOZone(Env::WriteLifeTimeHint file_lifetime, IOType io_type,
                           Zone **out_zone);
   IOStatus AllocateMetaZone(Zone **out_meta_zone);
+
+  IOStatus AllocateWALZone(Zone **out_zone, WALZoneAllocationHint *hint);
+  // [kqh] Switch current active WAL Zone
+  IOStatus SwitchWALZone();
+  // [kqh] If one WAL zone is not used, reset it
+  IOStatus ResetUnusedWALZones();
+  int GetAdvancedActiveWALZoneIndex() {
+    return (active_wal_zone_ + 1) % wal_zones_.size();
+  }
 
   long OpenIOZoneCount() const { return open_io_zones_.load(); }
 
@@ -242,6 +275,16 @@ class ZonedBlockDevice {
 
   IOStatus TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint lifetime,
                            uint32_t min_capacity);
+
+  void GetZonesForWALAllocation() {
+    // Always use the first two zones for WAL allocation
+    wal_zones_.push_back(io_zones[0]);
+    wal_zones_.push_back(io_zones[1]);
+  }
+
+  bool IsWALZone(const Zone* zone) {
+    return zone->ZoneId() == 3 || zone->ZoneId() == 4;
+  }
 
  public:
   std::string ErrorToString(int err);

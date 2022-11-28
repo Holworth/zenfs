@@ -7,6 +7,7 @@
 #include <mutex>
 
 #include "fs/io_zenfs.h"
+#include "fs/log.h"
 #include "rocksdb/io_status.h"
 #include "util/mutexlock.h"
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
@@ -1139,6 +1140,7 @@ Status ZenFS::DecodeFileUpdateFrom(Slice* slice, bool replace) {
   Status s;
 
   s = update->DecodeFrom(slice);
+  ZnsLog(kRed, "s = %s", s.ToString().c_str());
   if (!s.ok()) return s;
 
   id = update->GetID();

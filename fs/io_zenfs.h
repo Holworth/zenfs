@@ -102,6 +102,11 @@ class ZoneFile {
   IOStatus Append(void* buffer, int data_size);
   IOStatus BufferedAppend(char* data, uint32_t size);
   IOStatus SparseAppend(char* data, uint32_t size);
+
+  // Append the specified data slice atomically in a zone
+  IOStatus BufferedAppendAtomic(char* data, uint32_t size);
+  IOStatus SparseAppendAtomic(char* data, uint32_t size);
+
   IOStatus SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime);
   void SetIOType(IOType io_type);
   std::string GetFilename();
@@ -121,6 +126,7 @@ class ZoneFile {
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
   void PushExtent();
   IOStatus AllocateNewZone();
+  IOStatus AllocateNewZoneForWrite(size_t size);
 
   void EncodeTo(std::string* output, uint32_t extent_start);
   void EncodeUpdateTo(std::string* output) {

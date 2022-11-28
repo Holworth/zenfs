@@ -11,7 +11,10 @@
 #include <thread>
 
 #include "fs/io_zenfs.h"
+#include "fs/log.h"
 #include "fs/metrics.h"
+#include "rocksdb/file_system.h"
+#include "util/filename.h"
 #include "util/string_util.h"
 #if !defined(ROCKSDB_LITE) && !defined(OS_WIN)
 
@@ -318,7 +321,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   if (ios != IOStatus::OK()) return ios;
 
   // xzw: we limit the total zones here to 500
-  info.nr_zones = 100;
+  info.nr_zones = 500;
   block_sz_ = info.pblock_size;
   zone_sz_ = info.zone_size;
   nr_zones_ = info.nr_zones;
@@ -390,6 +393,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   }
 
   // (kqh) Use a few empty zones for provisioning
+  /*
   for (auto z : io_zones) {
     if (z->IsEmpty() && provisioning_zones.size() < nr_provisioning_zones_) {
       provisioning_zones.emplace_back(z);
@@ -404,6 +408,9 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   for (const auto &z : provisioning_zones) {
     printf("[kqh]: %s\n", z->ToString().c_str());
   }
+  */
+
+  GetZonesForWALAllocation();
 
   free(zone_rep);
   start_time_ = time(NULL);
@@ -495,14 +502,6 @@ void ZonedBlockDevice::LogGarbageInfo() {
       continue;
     }
 
-    /*
-    printf(
-        "[kqh] Id%d z->wp_=%lu z->start_=%lu z->used_capacity_=%lu "
-        "z->max_capacity_=%lu\n",
-        z->ZoneId(), z->wp_, z->start_, z->used_capacity_.load(),
-        z->max_capacity_);
-    */
-
     double garbage_rate =
         double(z->wp_ - z->start_ - z->used_capacity_) / z->max_capacity_;
     assert(garbage_rate >= 0);
@@ -552,8 +551,8 @@ unsigned int GetLifeTimeDiff(Env::WriteLifeTimeHint zone_lifetime,
     }
   }
 
-  // (kqh): For a zone with lifetime not set, you can fill in any possible files,
-  // thus the diff is 0
+  // (kqh): For a zone with lifetime not set, you can fill in any possible
+  // files, thus the diff is 0
   if (zone_lifetime == Env::WLTH_NOT_SET) return 0;
   if (zone_lifetime > file_lifetime) return zone_lifetime - file_lifetime;
   // if (zone_lifetime == file_lifetime) return LIFETIME_DIFF_COULD_BE_WORSE;
@@ -592,6 +591,10 @@ IOStatus ZonedBlockDevice::AllocateMetaZone(Zone **out_meta_zone) {
 IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
   // TODO: Some zones may need to used for provisioning
   for (const auto z : io_zones) {
+    if (IsWALZone(z)) {
+      continue;
+    }
+
     if (z->Acquire()) {
       // IsEmpty() means this zone has not been written yet
       // IsUsed() means there is valid data in this zone
@@ -631,8 +634,10 @@ void ZonedBlockDevice::WaitForOpenIOZoneToken(bool prioritized) {
   std::unique_lock<std::mutex> lk(zone_resources_mtx_);
   zone_resources_.wait(lk, [this, allocator_open_limit] {
     auto open_io_zones = open_io_zones_.load();
+    /*
     printf("[deadlock] current open_io_zones:%ld need:%ld tid=%d\n",
            open_io_zones, allocator_open_limit, std::this_thread::get_id());
+           */
     if (open_io_zones_.load() < allocator_open_limit) {
       open_io_zones_++;
       return true;
@@ -640,8 +645,10 @@ void ZonedBlockDevice::WaitForOpenIOZoneToken(bool prioritized) {
       return false;
     }
   });
+  /*
   printf("[deadlock] WaitForOpenIOZoneToken prioritized=%d Done tid=%d\n",
          prioritized, std::this_thread::get_id());
+  */
 }
 
 bool ZonedBlockDevice::GetActiveIOZoneTokenIfAvailable() {
@@ -687,6 +694,10 @@ IOStatus ZonedBlockDevice::ApplyFinishThreshold() {
   if (finish_threshold_ == 0) return IOStatus::OK();
 
   for (const auto z : io_zones) {
+    if (IsWALZone(z)) {
+      continue;
+    }
+
     if (z->Acquire()) {
       bool within_finish_threshold =
           z->capacity_ < (z->max_capacity_ * finish_threshold_ / 100);
@@ -718,6 +729,10 @@ IOStatus ZonedBlockDevice::FinishCheapestIOZone() {
   Zone *finish_victim = nullptr;
 
   for (const auto z : io_zones) {
+    if (IsWALZone(z)) {
+      continue;
+    }
+
     if (z->Acquire()) {
       // Empty and Full Zone does not occupy Active Zone Token
       if (z->IsEmpty() || z->IsFull()) {
@@ -773,6 +788,10 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
          WriteHintToString(file_lifetime).c_str());
 
   for (const auto z : io_zones) {
+    if (IsWALZone(z)) {
+      continue;
+    }
+
     if (z->Acquire()) {
       // printf("[kqh] Zone: %s\n", z->ToString().c_str());
       // (kqh): Skip this zone if it is marked as provisioning zone
@@ -784,8 +803,8 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
       if ((z->used_capacity_ > 0) && !z->IsFull() &&
           z->capacity_ >= min_capacity) {
         unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
-        // printf("[kqh] Zone(%d) Diff = %d BestDiff = %d Zone(%s)\n", z->ZoneId(),
-               // diff, best_diff, z->ToString().c_str());
+        // printf("[kqh] Zone(%d) Diff = %d BestDiff = %d Zone(%s)\n",
+        // z->ZoneId(), diff, best_diff, z->ToString().c_str());
         if (diff <= best_diff) {
           if (allocated_zone != nullptr) {
             s = allocated_zone->CheckRelease();
@@ -821,6 +840,10 @@ IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out) {
   IOStatus s;
   Zone *allocated_zone = nullptr;
   for (const auto z : io_zones) {
+    if (IsWALZone(z)) {
+      continue;
+    }
+
     if (z->Acquire()) {
       if (z->IsProvisioningZone()) {
         s = z->CheckRelease();
@@ -898,6 +921,94 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone,
     migrating_ = false;
   }
   return s;
+}
+
+IOStatus ZonedBlockDevice::AllocateWALZone(Zone **out_zone,
+                                           WALZoneAllocationHint *hint) {
+  ZnsLog(kRed, "[kqh] AllocateWALZone(active=%d)", active_wal_zone_);
+  ZnsLog(kRed, "[kqh] AllocateWALZone: zone[0]=%s\nzone[1]=%s",
+         wal_zones_[0]->ToString().c_str(), wal_zones_[1]->ToString().c_str());
+
+  ResetUnusedWALZones();
+  if (active_wal_zone_ == kNoActiveWALZone) {
+    assert(wal_zones_[0]->IsEmpty() || wal_zones_[1]->IsEmpty());
+    if (wal_zones_[0]->IsEmpty() && wal_zones_[1]->IsEmpty()) {
+      active_wal_zone_ = 0;
+    } else if (!wal_zones_[0]->IsEmpty()) {
+      active_wal_zone_ = 0;
+    } else if (!wal_zones_[1]->IsEmpty()) {
+      active_wal_zone_ = 1;
+    }
+    if (active_wal_zone_ == kNoActiveWALZone) {
+      return IOStatus::NoSpace("No Space for WAL write");
+    }
+  }
+
+  // (kqh): How do we deal with open zone token?
+  // (xzw): An ActiveToken should be taken at the
+  //        first allocation
+  WaitForOpenIOZoneToken(true);
+
+  // Directly return if the active zone has enough space
+  auto ret = wal_zones_[active_wal_zone_];
+  if (ret->GetCapacityLeft() > GetBlockSize()) {
+    *out_zone = ret;
+    (*out_zone)->LoopForAcquire();
+    // (xzw): ensure an active zone is held
+    if ((*out_zone)->IsEmpty()) {
+      auto get_token = GetActiveIOZoneTokenIfAvailable();
+      assert(get_token);
+    }
+    return IOStatus::OK();
+  }
+
+  // Otherwise open a new WAL Zone
+  auto s = SwitchWALZone();
+  if (!s.ok()) {
+    PutOpenIOZoneToken();
+    return s;
+  }
+  *out_zone = wal_zones_[active_wal_zone_];
+  // (kqh) Loop until get the write ownership of this zone
+  (*out_zone)->LoopForAcquire();
+  return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::SwitchWALZone() {
+  auto next_wal_zone = wal_zones_[GetAdvancedActiveWALZoneIndex()];
+  assert(next_wal_zone->IsEmpty() && !next_wal_zone->IsBusy());
+
+  auto get_token = GetActiveIOZoneTokenIfAvailable();
+  if (!get_token) {
+    return IOStatus::NoSpace("WALAllocation Get Active Zone Token failed");
+  }
+  // (kqh): May need to know all valid file extents in this zone
+  active_wal_zone_ = GetAdvancedActiveWALZoneIndex();
+  return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::ResetUnusedWALZones() {
+  for (decltype(wal_zones_.size()) i = 0; i < wal_zones_.size(); ++i) {
+    if (i == active_wal_zone_) {
+      continue;
+    }
+    auto z = wal_zones_[i];
+    if (wal_zones_[i]->Acquire()) {
+      if (!z->IsEmpty() && !z->IsUsed()) {
+        ZnsLog(kBlue, "[kqh] ResetUnusedWALZones: reset zone(%s)\n",
+               z->ToString().c_str());
+        bool full = z->IsFull();
+        IOStatus reset_status = z->Reset();
+        IOStatus release_status = z->CheckRelease();
+        if (!release_status.ok()) return release_status;
+        if (!full) PutActiveIOZoneToken();
+      } else {
+        IOStatus release_status = z->CheckRelease();
+        if (!release_status.ok()) return release_status;
+      }
+    }
+  }
+  return IOStatus::OK();
 }
 
 IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
