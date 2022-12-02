@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -58,7 +59,7 @@ class ZoneSnapshot {
         wp(zone.wp_),
         capacity(zone.capacity_),
         used_capacity(zone.used_capacity_),
-        max_capacity(zone.max_capacity_), 
+        max_capacity(zone.max_capacity_),
         id(zone.ZoneId()) {}
 };
 
@@ -81,11 +82,14 @@ class ZoneFileSnapshot {
  public:
   uint64_t file_id;
   std::string filename;
+  uint64_t level;
   std::vector<ZoneExtentSnapshot> extents;
 
  public:
   ZoneFileSnapshot(ZoneFile& file)
-      : file_id(file.GetID()), filename(file.GetFilename()) {
+      : file_id(file.GetID()),
+        filename(file.GetFilename()),
+        level(file.GetLevel()) {
     for (const auto* extent : file.GetExtents()) {
       extents.emplace_back(*extent, filename);
     }

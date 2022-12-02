@@ -61,19 +61,29 @@ void ZoneExtent::EncodeJson(std::ostream& json_stream) {
 
 enum ZoneFileTag : uint32_t {
   kFileID = 1,
-  kFileNameDeprecated = 2,
-  kFileSize = 3,
-  kWriteLifeTimeHint = 4,
-  kExtent = 5,
-  kModificationTime = 6,
-  kActiveExtentStart = 7,
-  kIsSparse = 8,
-  kLinkedFilename = 9,
+
+  // (zxw): for placement scheme
+  kFileLevel = 2,
+
+  kFileNameDeprecated = 4,
+  kFileSize = 4,
+  kWriteLifeTimeHint = 5,
+  kExtent = 6,
+  kModificationTime = 7,
+  kActiveExtentStart = 8,
+  kIsSparse = 9,
+  kLinkedFilename = 10,
+
 };
 
 void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
   PutFixed32(output, kFileID);
   PutFixed64(output, file_id_);
+
+  PutFixed32(output, kFileLevel);
+  PutFixed64(output, level_);
+
+  ZnsLog(Color::kBlue, ">>>>> xzw >>>>> encoding level %lu of file %lu\n", level_, file_id_);
 
   PutFixed32(output, kFileSize);
   PutFixed64(output, file_size_);
@@ -147,6 +157,12 @@ Status ZoneFile::DecodeFrom(Slice* input) {
     if (!GetFixed32(input, &tag)) break;
 
     switch (tag) {
+      case kFileLevel:
+        if (!GetFixed64(input, &level_))
+          return Status::Corruption("ZoneFile", "Missing file level");
+        ZnsLog(Color::kBlue, ">>>>> xzw >>>>> decoding level %lu of file %lu\n", level_,
+               file_id_);
+        break;
       case kFileSize:
         if (!GetFixed64(input, &file_size_))
           return Status::Corruption("ZoneFile", "Missing file size");
@@ -212,6 +228,9 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
   SetWriteLifeTimeHint(update->GetWriteLifeTimeHint());
   SetFileModificationTime(update->GetFileModificationTime());
 
+  // (xzw): Level info should be recovered for our placement scheme
+  SetLevel(update->GetLevel());
+
   if (replace) {
     ClearExtents();
   }
@@ -242,6 +261,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id)
       io_type_(IOType::kUnknown),
       file_size_(0),
       file_id_(file_id),
+      level_(uint64_t(-1)),
       nr_synced_extents_(0),
       m_time_(0) {}
 
@@ -252,6 +272,10 @@ uint64_t ZoneFile::GetFileSize() { return file_size_; }
 void ZoneFile::SetFileSize(uint64_t sz) { file_size_ = sz; }
 void ZoneFile::SetFileModificationTime(time_t mt) { m_time_ = mt; }
 void ZoneFile::SetIOType(IOType io_type) { io_type_ = io_type; }
+
+// (xzw): level accessors
+uint64_t ZoneFile::GetLevel() const { return level_; }
+void ZoneFile::SetLevel(uint64_t level) { level_ = level; }
 
 ZoneFile::~ZoneFile() {
   ClearExtents();
@@ -273,7 +297,8 @@ void ZoneFile::ClearExtents() {
 }
 
 IOStatus ZoneFile::CloseWR() {
-  ZnsLog(kGreen, "[kqh] File(%s) CloseWR", linkfiles_.front().c_str());
+  ZnsLog(kGreen, "[kqh] File(%s) of id %lu with size %lu CloseWR",
+         linkfiles_.front().c_str(), file_id_, file_size_);
   IOStatus s;
   if (open_for_wr_) {
     /* Mark up the file as being closed */
@@ -483,6 +508,24 @@ IOStatus ZoneFile::AllocateNewZoneForWrite(size_t size) {
       s = zbd_->AllocateWALZone(&zone, &hint);
       break;
     }
+    case IOType::kCompactionOutputFile:
+    // (xzw): fall through
+    case IOType::kFlushFile: {
+      /* (xzw:TODO)
+       * For performance monitoring does not distinguish KeySST and ValueSST
+       * but both of them are labeled either kCompactionOutputFile or
+       * kFlushFile. We can distinguish them here by checking whether level
+       * if -1 (ValueSST).
+       */
+      if (level_ == -1) {
+        ValueSSTZoneAllocationHint hint;
+        s = zbd_->AllocateValueSSTZone(&zone, &hint);
+      } else {
+        KeySSTZoneAllocationHint hint(size, level_);
+        s = zbd_->AllocateKeySSTZone(&zone, &hint);
+      }
+      break;
+    }
     default: {
       s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone);
       break;
@@ -567,10 +610,11 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
 
     uint64_t extent_length = wr_size;
 
-    ZnsLog(kDisableLog,
-           "[kqh] File(%s) BufferedAppend %lf MiB to Zone(%d), FileSize %lf MiB",
-           GetFilename().c_str(), ToMiB(wr_size + pad_sz),
-           active_zone_->ZoneId(), ToMiB(file_size_));
+    ZnsLog(
+        kDisableLog,
+        "[kqh] File(%s) BufferedAppend %lf MiB to Zone(%d), FileSize %lf MiB",
+        GetFilename().c_str(), ToMiB(wr_size + pad_sz), active_zone_->ZoneId(),
+        ToMiB(file_size_));
 
     s = active_zone_->Append(buffer, wr_size + pad_sz);
     if (!s.ok()) return s;
@@ -758,8 +802,8 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
 
     ZnsLog(kDisableLog,
            "[kqh] File(%s) SimpleAppend %lf MiB to Zone(%d), FileSize %lf MiB",
-           GetFilename().c_str(), ToMiB(wr_size),
-           active_zone_->ZoneId(), ToMiB(file_size_));
+           GetFilename().c_str(), ToMiB(wr_size), active_zone_->ZoneId(),
+           ToMiB(file_size_));
 
     s = active_zone_->Append((char*)data + offset, wr_size);
     if (!s.ok()) return s;

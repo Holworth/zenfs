@@ -806,6 +806,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     if (reopen && zoneFile != nullptr) {
       result->reset(new ZonedWritableFile(zbd_, !file_opts.use_direct_writes,
                                           zoneFile, &metadata_writer_));
+      (*result)->SetFileLevel(zoneFile->GetLevel());
       return IOStatus::OK();
     }
 
@@ -819,6 +820,14 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     zoneFile->SetFileModificationTime(time(0));
     zoneFile->AddLinkName(fname);
 
+    // (xzw): This file is newly created thus the level number is
+    //        passed from the callers, we should record it before
+    //        calling 'reset to 'result
+    //        If this branch is not executed, the file is not an 
+    //        SST
+    if (*result) {
+      zoneFile->SetLevel((*result)->GetFileLevel());
+    }
     /* RocksDB does not set the right io type(!)*/
     if (ends_with(fname, ".log")) {
       zoneFile->SetIOType(IOType::kWAL);
@@ -840,6 +849,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     files_.insert(std::make_pair(fname.c_str(), zoneFile));
     result->reset(new ZonedWritableFile(zbd_, !file_opts.use_direct_writes,
                                         zoneFile, &metadata_writer_));
+    (*result)->SetFileLevel(zoneFile->GetLevel());
   }
 
   if (resetIOZones) s = zbd_->ResetUnusedIOZones();

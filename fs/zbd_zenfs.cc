@@ -1045,7 +1045,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
     }
   }
 
-  printf("[xzw] Start Allocate IO Zone, tid=%d\n",
+  ZnsLog(Color::kBlue, "[xzw] Start Allocate IO Zone, tid=%d\n",
          (std::this_thread::get_id()));
 
   WaitForOpenIOZoneToken(io_type == IOType::kWAL);
@@ -1152,6 +1152,14 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
   }
   */
 
+  return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::AllocateKeySSTZone(Zone **out_zone, KeySSTZoneAllocationHint *hint) {
+  return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::AllocateValueSSTZone(Zone **out_zone, ValueSSTZoneAllocationHint *hint) {
   return IOStatus::OK();
 }
 

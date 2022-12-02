@@ -82,6 +82,17 @@ struct WALZoneAllocationHint : public ZoneAllocationHint {
   ZoneFile *zone_file;
 };
 
+struct ValueSSTZoneAllocationHint : public ZoneAllocationHint {};
+
+struct KeySSTZoneAllocationHint : public ZoneAllocationHint {
+ public:
+  KeySSTZoneAllocationHint() = default;
+  KeySSTZoneAllocationHint(size_t size, int level)
+      : size_(size), level_(level) {}
+  size_t size_;
+  int level_;
+};
+
 class Zone {
   ZonedBlockDevice *zbd_;
   std::atomic_bool busy_;
@@ -141,8 +152,39 @@ class Zone {
   std::string ToString() const;
 };
 
+/*
+ * class KeySSTZones
+ * KeySSTZones manages *ALL* zones used for key SST.
+ */
+class KeySSTZones {
+ private:
+  // these zones store levels from Level 0 to Level k
+  // where k is currently 3
+  std::vector<Zone *> lower_zones_;
+  std::vector<Zone *> high_zones_;
+
+ public:
+  KeySSTZones() = default;
+  ~KeySSTZones() = default;
+
+  void PushBackZone(Zone *zone, bool to_lower = true) {
+    if (to_lower) {
+      lower_zones_.push_back(zone);
+    } else {
+      high_zones_.push_back(zone);
+    }
+  }
+
+  std::vector<Zone *> &LowZones() { return lower_zones_; }
+
+  std::vector<Zone *> &HighZones() { return high_zones_; }
+};
+
+class ValueSSTZones {};
+
 class ZonedBlockDevice {
  private:
+  // (xzw:TODO) considering referecing the ZenFS within zbd_
   std::string filename_;
   uint32_t block_sz_;
   uint64_t zone_sz_;
@@ -213,6 +255,19 @@ class ZonedBlockDevice {
   IOStatus SwitchWALZone();
   // [kqh] If one WAL zone is not used, reset it
   IOStatus ResetUnusedWALZones();
+
+  /*
+   * (xzw:TODO): allocate a key sst from managed KeySSTZones
+   *
+   * During the allocation, if the active low zone is used up,
+   * we should migrate valid files from the used-up zone to the backup
+   * zone and activate the backup zone as the new active low zone
+   */
+  IOStatus AllocateKeySSTZone(Zone **out_zone, KeySSTZoneAllocationHint *hint);
+
+  IOStatus AllocateValueSSTZone(Zone **out_zone,
+                                ValueSSTZoneAllocationHint *hint);
+
   int GetAdvancedActiveWALZoneIndex() {
     return (active_wal_zone_ + 1) % wal_zones_.size();
   }
@@ -282,7 +337,7 @@ class ZonedBlockDevice {
     wal_zones_.push_back(io_zones[1]);
   }
 
-  bool IsWALZone(const Zone* zone) {
+  bool IsWALZone(const Zone *zone) {
     return zone->ZoneId() == 3 || zone->ZoneId() == 4;
   }
 

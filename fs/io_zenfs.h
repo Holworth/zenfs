@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include "fs/metrics.h"
 #include "rocksdb/slice.h"
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
@@ -71,10 +72,13 @@ class ZoneFile {
   uint64_t extent_start_ = NO_EXTENT;
   uint64_t extent_filepos_ = 0;
 
+  // (kqh & xzw): for TerarkDB on ZNS
   Env::WriteLifeTimeHint lifetime_;
   IOType io_type_; /* Only used when writing */
   uint64_t file_size_;
   uint64_t file_id_;
+  uint64_t level_;
+
 
   uint32_t nr_synced_extents_ = 0;
   bool open_for_wr_ = false;
@@ -115,6 +119,11 @@ class ZoneFile {
   uint64_t GetFileSize();
   void SetFileSize(uint64_t sz);
   void ClearExtents();
+
+  // (xzw): level accessors
+  // if the return level is -1, the file is not a KeySST
+  uint64_t GetLevel() const;
+  void SetLevel(uint64_t level);
 
   uint32_t GetBlockSize() { return zbd_->GetBlockSize(); }
   ZonedBlockDevice* GetZbd() { return zbd_; }
@@ -249,6 +258,8 @@ class ZonedWritableFile : public FSWritableFile {
   virtual Env::WriteLifeTimeHint GetWriteLifeTimeHint() override {
     return zoneFile_->GetWriteLifeTimeHint();
   }
+  void SetLevel(uint64_t level) { zoneFile_->SetLevel(level); }
+  uint64_t GetLevel() const { return zoneFile_->GetLevel(); }
 
  private:
   IOStatus BufferedWrite(const Slice& data);
