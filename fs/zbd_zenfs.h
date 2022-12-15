@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
@@ -32,6 +33,10 @@
 #include "rocksdb/io_status.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace config {
+  const static int kAggrLevelThreshold = 3;
+};
 
 inline std::string IOTypeToString(IOType type) {
   switch (type) {
@@ -68,6 +73,7 @@ inline std::string WriteHintToString(Env::WriteLifeTimeHint hint) {
 class ZonedBlockDevice;
 class ZoneSnapshot;
 class ZenFSSnapshotOptions;
+class ZenFS;
 
 class ZoneFile;
 
@@ -121,7 +127,7 @@ class Zone {
   bool IsEmpty();
   uint64_t GetZoneNr();
   uint64_t GetCapacityLeft();
-  bool IsBusy() { return this->busy_.load(std::memory_order_relaxed); }
+  bool IsBusy() const { return this->busy_.load(std::memory_order_relaxed); }
   bool Acquire() {
     bool expected = false;
     return this->busy_.compare_exchange_strong(expected, true,
@@ -185,6 +191,8 @@ class ValueSSTZones {};
 class ZonedBlockDevice {
  private:
   // (xzw:TODO) considering referecing the ZenFS within zbd_
+  ZenFS* zenfs_ = nullptr;
+
   std::string filename_;
   uint32_t block_sz_;
   uint64_t zone_sz_;
@@ -201,6 +209,9 @@ class ZonedBlockDevice {
   const static int kNoActiveWALZone = -1;
 
   std::vector<Zone *> key_sst_zones_;
+  int active_aggr_keysst_zone_ = kNoActiveAggrKeySSTZone;
+  const static int kNoActiveAggrKeySSTZone = -1;
+
   std::vector<Zone *> value_sst_zones_;
 
   std::vector<Zone *> meta_zones;
@@ -267,6 +278,8 @@ class ZonedBlockDevice {
 
   IOStatus AllocateValueSSTZone(Zone **out_zone,
                                 ValueSSTZoneAllocationHint *hint);
+  
+  IOStatus ResetUnusedKeySSTZones();
 
   int GetAdvancedActiveWALZoneIndex() {
     return (active_wal_zone_ + 1) % wal_zones_.size();
@@ -337,8 +350,31 @@ class ZonedBlockDevice {
     wal_zones_.push_back(io_zones[1]);
   }
 
-  bool IsWALZone(const Zone *zone) {
-    return zone->ZoneId() == 3 || zone->ZoneId() == 4;
+  void GetZonesForKeySSTAllocation() {
+    // Always use 3 zones preceding wal zones for KeySST allocation
+    io_zones[2]->capacity_ /= 100;
+    io_zones[3]->capacity_ /= 100;
+    io_zones[4]->capacity_ /= 100;
+    key_sst_zones_.push_back(io_zones[2]);
+    key_sst_zones_.push_back(io_zones[3]);
+    key_sst_zones_.push_back(io_zones[4]);
+
+    // (kqh): For simplicity, we use the first zone for storing aggr levels
+    // (xzw): should restore the correct active zone
+    active_aggr_keysst_zone_ = io_zones[2]->IsEmpty() ? 1 : 0;
+  }
+
+  IOStatus MigrateAggregatedLevelZone();
+
+  bool IsSpecialZone(const Zone *zone) {
+    bool is_wal_zone = zone->ZoneId() == 3 || zone->ZoneId() == 4;
+    bool is_keysst_zone =
+        zone->ZoneId() == 5 || zone->ZoneId() == 6 || zone->ZoneId() == 7;
+    return is_wal_zone || is_keysst_zone;
+  }
+
+  bool IsAggregatedLevel(int level) {
+    return level >= 0 && level <= config::kAggrLevelThreshold;
   }
 
  public:
@@ -352,6 +388,9 @@ class ZonedBlockDevice {
                                 unsigned int *best_diff_out, Zone **zone_out,
                                 uint32_t min_capacity = 0);
   IOStatus AllocateEmptyZone(Zone **zone_out);
+
+  void SetZenFS(ZenFS* fs) { zenfs_ = fs; }
+  ZenFS* GetZenFS() const { return zenfs_; }
 };
 
 }  // namespace ROCKSDB_NAMESPACE

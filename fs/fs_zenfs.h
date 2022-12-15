@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "rocksdb/io_status.h"
 #if __cplusplus >= 201703L
 #include <filesystem>
@@ -470,6 +472,10 @@ class ZenFS : public FileSystemWrapper {
   using FileToExtents =
       std::unordered_map<std::string, std::vector<ZoneExtentSnapshot*>>;
   IOStatus DoZoneCompaction(Zone* zone, const FileToExtents& extents_in_zone);
+  IOStatus MigrateAggregatedLevelZone(Zone* src_zone, Zone* dst_zone);
+  IOStatus GetAggrLevelZoneExtents(
+      std::map<std::string, std::vector<ZoneExtentSnapshot*>>* extents,
+      Zone* zone);
 };
 
 // Utility filesystem path implementation

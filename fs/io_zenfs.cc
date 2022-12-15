@@ -64,15 +64,16 @@ enum ZoneFileTag : uint32_t {
 
   // (zxw): for placement scheme
   kFileLevel = 2,
+  kFileType = 3,
 
   kFileNameDeprecated = 4,
-  kFileSize = 4,
-  kWriteLifeTimeHint = 5,
-  kExtent = 6,
-  kModificationTime = 7,
-  kActiveExtentStart = 8,
-  kIsSparse = 9,
-  kLinkedFilename = 10,
+  kFileSize = 5,
+  kWriteLifeTimeHint = 6,
+  kExtent = 7,
+  kModificationTime = 8,
+  kActiveExtentStart = 9,
+  kIsSparse = 10,
+  kLinkedFilename = 11,
 
 };
 
@@ -82,8 +83,11 @@ void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
 
   PutFixed32(output, kFileLevel);
   PutFixed64(output, level_);
+  PutFixed32(output, kFileType);
+  PutFixed64(output, uint64_t(io_type_));
 
-  ZnsLog(Color::kBlue, ">>>>> xzw >>>>> encoding level %lu of file %lu\n", level_, file_id_);
+  ZnsLog(Color::kBlue, ">>>>> xzw >>>>> encoding level %lu of file %lu\n",
+         level_, file_id_);
 
   PutFixed32(output, kFileSize);
   PutFixed64(output, file_size_);
@@ -160,9 +164,20 @@ Status ZoneFile::DecodeFrom(Slice* input) {
       case kFileLevel:
         if (!GetFixed64(input, &level_))
           return Status::Corruption("ZoneFile", "Missing file level");
-        ZnsLog(Color::kBlue, ">>>>> xzw >>>>> decoding level %lu of file %lu\n", level_,
-               file_id_);
+        ZnsLog(Color::kBlue, ">>>>> xzw >>>>> decoding level %lu of file %lu\n",
+               level_, file_id_);
         break;
+      case kFileType: {
+        uint64_t tmp = 0;
+        if (!GetFixed64(input, &tmp))
+          return Status::Corruption("ZoneFile", "Missing file type");
+        io_type_ = static_cast<IOType>(tmp);
+        ZnsLog(Color::kBlue,
+               ">>>>> xzw >>>>> decoding level %lu and type %lu of file %lu\n",
+               level_, uint64_t(io_type_), file_id_);
+        break;
+      }
+
       case kFileSize:
         if (!GetFixed64(input, &file_size_))
           return Status::Corruption("ZoneFile", "Missing file size");
@@ -509,7 +524,6 @@ IOStatus ZoneFile::AllocateNewZoneForWrite(size_t size) {
       break;
     }
     case IOType::kCompactionOutputFile:
-    // (xzw): fall through
     case IOType::kFlushFile: {
       /* (xzw:TODO)
        * For performance monitoring does not distinguish KeySST and ValueSST
@@ -547,42 +561,53 @@ IOStatus ZoneFile::AllocateNewZoneForWrite(size_t size) {
 IOStatus ZoneFile::BufferedAppendAtomic(char* buffer, uint32_t data_size) {
   WriteLock lck(this);
 
-  uint32_t left = data_size;
-  uint32_t wr_size;
+  uint32_t wr_size = data_size;
   uint32_t block_sz = GetBlockSize();
   IOStatus s;
 
   // Padding the buffered data to make it block-aligned
   uint32_t align = wr_size % block_sz;
   uint32_t pad_sz = 0;
+  uint64_t extent_length = wr_size;
 
   if (align) pad_sz = block_sz - align;
 
   /* the buffer size s aligned on block size, so this is ok*/
   if (pad_sz) memset(buffer + wr_size, 0x0, pad_sz);
 
-  while (true) {
-    if (active_zone_ == nullptr) {
-      s = AllocateNewZoneForWrite(wr_size + pad_sz);
-      if (!s.ok()) return s;
-    }
-
-    uint64_t extent_length = wr_size;
-
-    s = active_zone_->Append(buffer, wr_size + pad_sz);
-    if (!s.ok()) return s;
-
-    extents_.push_back(
-        new ZoneExtent(extent_start_, extent_length, active_zone_));
-
-    extent_start_ = active_zone_->wp_;
-    active_zone_->used_capacity_ += extent_length;
-    file_size_ += extent_length;
+  s = AllocateNewZoneForWrite(wr_size + pad_sz);
+  if (!s.ok() || !active_zone_) {
+    return s;
   }
+
+  s = active_zone_->Append(buffer, wr_size + pad_sz);
+  if (!s.ok()) {
+    return s;
+  }
+
+  extents_.push_back(
+      new ZoneExtent(extent_start_, extent_length, active_zone_));
+  active_zone_->used_capacity_ += extent_length;
+  file_size_ += extent_length;
+
+  ZnsLog(
+      kDisableLog,
+      "[kqh] File(%s) BufferedAppendAtomic (size=%u filesize=%lf) To Zone(%d)",
+      GetFilename().c_str(), data_size, ToMiB(file_size_),
+      active_zone_->ZoneId());
+
+  // Release the active zone immediately
+  ReleaseActiveZone();
+
+  return IOStatus::OK();
 }
 
 /* Byte-aligned writes without a sparse header */
 IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
+  if (IsKeySST()) {
+    return BufferedAppendAtomic(buffer, data_size);
+  }
+
   WriteLock lck(this);
 
   uint32_t left = data_size;
@@ -641,59 +666,6 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
   }
 
   return IOStatus::OK();
-}
-
-IOStatus ZoneFile::SparseAppendAtomic(char* sparse_buffer, uint32_t data_size) {
-  /*
-  WriteLock lck(this);
-
-  uint32_t left = data_size;
-  uint32_t wr_size = left;
-  uint32_t block_sz = GetBlockSize();
-  IOStatus s;
-
-  uint32_t align = wr_size % block_sz;
-  uint32_t pad_sz = 0;
-
-  if (align) pad_sz = block_sz - align;
-  if (pad_sz) memset(sparse_buffer + wr_size, 0x0, pad_sz);
-
-  uint64_t extent_length = wr_size - ZoneFile::SPARSE_HEADER_SIZE;
-  EncodeFixed64(sparse_buffer, extent_length);
-
-  if (active_zone_ == nullptr) {
-    s = AllocateNewZoneForWrite(wr_size + pad_sz);
-  } else {
-    if (active_zone_->GetCapacityLeft() < wr_size + pad_sz) {
-      // (kqh) This might be a wrong decision to directly close this
-      // zone as it may still has some free space
-      s = CloseActiveZone();
-      if (!s.ok()) {
-        return s;
-      }
-      s = AllocateNewZoneForWrite(wr_size + pad_sz);
-    }
-  }
-  if (!s.ok()) {
-    return s;
-  }
-
-  s = active_zone_->Append(sparse_buffer, wr_size + pad_sz);
-
-  if (!s.ok()) {
-    return s;
-  }
-
-  extents_.push_back(
-      new ZoneExtent(extent_start_ + ZoneFile::SPARSE_HEADER_SIZE,
-                     extent_length, active_zone_));
-
-  extent_start_ = active_zone_->wp_;
-  active_zone_->used_capacity_ += extent_length;
-  file_size_ += extent_length;
-
-  return IOStatus::OK();
-  */
 }
 
 /* Byte-aligned, sparse writes with inline metadata
@@ -773,6 +745,10 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
 
 /* Assumes that data and size are block aligned */
 IOStatus ZoneFile::Append(void* data, int data_size) {
+  if (IsKeySST()) {
+    return AppendAtomic(data, data_size);
+  }
+
   WriteLock lck(this);
 
   uint32_t left = data_size;
@@ -812,6 +788,40 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
     left -= wr_size;
     offset += wr_size;
   }
+
+  return IOStatus::OK();
+}
+
+IOStatus ZoneFile::AppendAtomic(void* buffer, int data_size) {
+  WriteLock lck(this);
+
+  uint32_t left = data_size;
+  uint32_t wr_size = left, offset = 0;
+  uint32_t extent_length = data_size;
+  IOStatus s = IOStatus::OK();
+
+  s = AllocateNewZoneForWrite(data_size);
+  if (!s.ok() || !active_zone_) {
+    return s;
+  }
+
+  s = active_zone_->Append((char*)buffer, wr_size);
+  if (!s.ok()) {
+    return s;
+  }
+
+  extents_.push_back(
+      new ZoneExtent(extent_start_, extent_length, active_zone_));
+  active_zone_->used_capacity_ += extent_length;
+  file_size_ += extent_length;
+
+  ZnsLog(kDisableLog,
+         "[kqh] File(%s) SingleAppendAtomic (size=%u filesize=%lf) To Zone(%d)",
+         GetFilename().c_str(), data_size, ToMiB(file_size_),
+         active_zone_->ZoneId());
+
+  // Release the active zone immediately
+  ReleaseActiveZone();
 
   return IOStatus::OK();
 }
@@ -1342,8 +1352,8 @@ IOStatus ZoneFile::ReadData(uint64_t offset, uint32_t length, Slice* data) {
 // (kqh): TODO: May add throughput reporter here to record migration throughput
 IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
                                Zone* target_zone) {
-  printf("[kqh] Migrate Data: offset(%zu) len(%u) to ZoneId(%d)\n", offset,
-         length, target_zone->ZoneId());
+  ZnsLog(kBlue, "[kqh] Migrate Data: offset(%zu) len(%u) to ZoneId(%d)\n",
+         offset, length, target_zone->ZoneId());
 
   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_GC_READ_THROUGHPUT, length);
   uint32_t step = 128 << 10;

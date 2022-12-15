@@ -62,6 +62,7 @@ class MetadataWriter {
 class ZoneFile {
  private:
   const uint64_t NO_EXTENT = 0xffffffffffffffff;
+  static const int kMaxLSMLevel = 32;
 
   ZonedBlockDevice* zbd_;
 
@@ -78,7 +79,6 @@ class ZoneFile {
   uint64_t file_size_;
   uint64_t file_id_;
   uint64_t level_;
-
 
   uint32_t nr_synced_extents_ = 0;
   bool open_for_wr_ = false;
@@ -109,7 +109,7 @@ class ZoneFile {
 
   // Append the specified data slice atomically in a zone
   IOStatus BufferedAppendAtomic(char* data, uint32_t size);
-  IOStatus SparseAppendAtomic(char* data, uint32_t size);
+  IOStatus AppendAtomic(void* buffer, int data_size);
 
   IOStatus SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime);
   void SetIOType(IOType io_type);
@@ -124,6 +124,12 @@ class ZoneFile {
   // if the return level is -1, the file is not a KeySST
   uint64_t GetLevel() const;
   void SetLevel(uint64_t level);
+
+  bool IsKeySST() const {
+    return (io_type_ == IOType::kFlushFile ||
+            io_type_ == IOType::kCompactionOutputFile) &&
+           GetLevel() != -1;
+  }
 
   uint32_t GetBlockSize() { return zbd_->GetBlockSize(); }
   ZonedBlockDevice* GetZbd() { return zbd_; }

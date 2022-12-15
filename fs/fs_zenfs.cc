@@ -4,10 +4,13 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <cassert>
+#include <memory>
 #include <mutex>
 
 #include "fs/io_zenfs.h"
 #include "fs/log.h"
+#include "fs/zbd_zenfs.h"
 #include "rocksdb/io_status.h"
 #include "util/mutexlock.h"
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
@@ -251,6 +254,7 @@ ZenFS::ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
   Info(logger_, "ZenFS initializing");
   next_file_id_ = 1;
   metadata_writer_.zenFS = this;
+  zbd_->SetZenFS(this);
 }
 
 ZenFS::~ZenFS() {
@@ -823,7 +827,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     // (xzw): This file is newly created thus the level number is
     //        passed from the callers, we should record it before
     //        calling 'reset to 'result
-    //        If this branch is not executed, the file is not an 
+    //        If this branch is not executed, the file is not an
     //        SST
     if (*result) {
       zoneFile->SetLevel((*result)->GetFileLevel());
@@ -836,7 +840,6 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
       zoneFile->SetIOType(file_opts.io_options.type);
       printf("[kqh] Set ZoneFile(%s) Type: %s\n", filename.c_str(),
              IOTypeToString(zoneFile->GetIOType()).c_str());
-      // zoneFile->SetIOType(IOType::kUnknown);
     }
 
     /* Persist the creation of the file */
@@ -1861,6 +1864,60 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
   return IOStatus::OK();
 }
 
+IOStatus ZenFS::MigrateAggregatedLevelZone(Zone* src_zone, Zone* dst_zone) {
+  assert(src_zone->IsBusy());
+  IOStatus s;
+
+  std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
+  s = GetAggrLevelZoneExtents(&file_extents, src_zone);
+
+  // Release any heap memory
+  auto release_mem = [&]() {
+    for (auto it : file_extents) {
+      for (const auto& ext : it.second) {
+        delete ext;
+      }
+    }
+  };
+
+  for (auto it : file_extents) {
+    // 
+    // One concern is that MigrateFileExtents function does not migrate a file 
+    // that is being written. We might enter this function while there are some
+    // activated key sst whose extents are in the migrated zone. In such a case, 
+    // these extents will not be migrated and the old zone can not be released. 
+    // 
+    // We avoid this case by prohibiting a key sst being written twice. All its 
+    // content must be packed into one AppendAtomic call. 
+    // 
+    s = MigrateFileExtents(it.first, it.second, dst_zone);
+    if (!s.ok()) {
+      release_mem();
+      return s;
+    }
+  }
+  release_mem();
+  return IOStatus::OK();
+}
+
+IOStatus ZenFS::GetAggrLevelZoneExtents(
+    std::map<std::string, std::vector<ZoneExtentSnapshot*>>* extents,
+    Zone* zone) {
+  std::lock_guard<std::mutex> file_lock(files_mtx_);
+  for (const auto& file_it : files_) {
+    ZoneFile& file = *(file_it.second);
+    if (file.IsKeySST() && file.GetLevel() < config::kAggrLevelThreshold) {
+      // extent -> file mapping
+      assert(ends_with(file.GetFilename(), ".sst"));
+      for (auto* ext : file.GetExtents()) {
+        (*extents)[file.GetFilename()].emplace_back(
+            new ZoneExtentSnapshot(*ext, file.GetFilename()));
+      }
+    }
+  }
+  return IOStatus::OK();
+}
+
 IOStatus ZenFS::MigrateFileExtentsWithFSLock(
     const std::string& fname,
     const std::vector<ZoneExtentSnapshot*>& migrate_exts, Zone* dest_zone) {
@@ -1868,17 +1925,16 @@ IOStatus ZenFS::MigrateFileExtentsWithFSLock(
   Info(logger_, "MigrateFileExtentsWithFSLock, fname: %s, extent count: %lu",
        fname.data(), migrate_exts.size());
 
-  printf("[kqh] MigrateFileExtentsWithFSLock, fname: %s, extent count: %lu\n",
+  ZnsLog(kDefault,
+         "[kqh] MigrateFileExtentsWithFSLock, fname: %s, extent count: %lu\n",
          fname.data(), migrate_exts.size());
 
   // The file may be deleted by other threads, better double check.
   auto zfile = GetFileNoLock(fname);
-  // It seems during migration, only migrate read-only file
+  // It seems during migration, only read-only file can be migrated
   if (zfile == nullptr) {
-    printf("[kqh] Migrate File(%s) Not Found\n", fname.c_str());
     return IOStatus::OK();
   } else if (zfile->IsOpenForWR()) {
-    printf("[kqh] Migrate File(%s) IsOpenForWR()\n", fname.c_str());
     return IOStatus::OK();
   }
 
@@ -1900,11 +1956,11 @@ IOStatus ZenFS::MigrateFileExtentsWithFSLock(
 
     if (it == migrate_exts.end()) {
       Info(logger_, "Migrate extent not found, ext_start: %lu", ext->start_);
-      printf("[kqh] Migrate extent not found, ext_start: %lu\n", ext->start_);
+      ZnsLog(kDefault, "[kqh] Migrate extent not found, ext_start: %lu\n", ext->start_);
       continue;
     }
 
-    printf("[kqh] Migrate extent: length(%zu) zone(%s)\n", ext->length_,
+    ZnsLog(kDefault, "[kqh] Migrate extent: length(%zu) zone(%s)\n", ext->length_,
            ext->zone_->ToString().c_str());
 
     Zone* target_zone = dest_zone;
@@ -1940,7 +1996,7 @@ IOStatus ZenFS::MigrateFileExtents(
   Info(logger_, "MigrateFileExtents, fname: %s, extent count: %lu",
        fname.data(), migrate_exts.size());
 
-  printf("[kqh] MigrateFileExtents, fname: %s, extent count: %lu\n",
+  ZnsLog(kDefault, "[kqh] MigrateFileExtents, fname: %s, extent count: %lu\n",
          fname.data(), migrate_exts.size());
 
   // The file may be deleted by other threads, better double check.

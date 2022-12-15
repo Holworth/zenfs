@@ -37,6 +37,7 @@
 #include <utility>
 #include <vector>
 
+#include "fs_zenfs.h"
 #include "rocksdb/env.h"
 #include "rocksdb/io_status.h"
 #include "snapshot.h"
@@ -411,6 +412,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   */
 
   GetZonesForWALAllocation();
+  GetZonesForKeySSTAllocation();
 
   free(zone_rep);
   start_time_ = time(NULL);
@@ -591,7 +593,7 @@ IOStatus ZonedBlockDevice::AllocateMetaZone(Zone **out_meta_zone) {
 IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
   // TODO: Some zones may need to used for provisioning
   for (const auto z : io_zones) {
-    if (IsWALZone(z)) {
+    if (IsSpecialZone(z)) {
       continue;
     }
 
@@ -694,7 +696,7 @@ IOStatus ZonedBlockDevice::ApplyFinishThreshold() {
   if (finish_threshold_ == 0) return IOStatus::OK();
 
   for (const auto z : io_zones) {
-    if (IsWALZone(z)) {
+    if (IsSpecialZone(z)) {
       continue;
     }
 
@@ -729,7 +731,7 @@ IOStatus ZonedBlockDevice::FinishCheapestIOZone() {
   Zone *finish_victim = nullptr;
 
   for (const auto z : io_zones) {
-    if (IsWALZone(z)) {
+    if (IsSpecialZone(z)) {
       continue;
     }
 
@@ -788,7 +790,7 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
          WriteHintToString(file_lifetime).c_str());
 
   for (const auto z : io_zones) {
-    if (IsWALZone(z)) {
+    if (IsSpecialZone(z)) {
       continue;
     }
 
@@ -840,7 +842,7 @@ IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out) {
   IOStatus s;
   Zone *allocated_zone = nullptr;
   for (const auto z : io_zones) {
-    if (IsWALZone(z)) {
+    if (IsSpecialZone(z)) {
       continue;
     }
 
@@ -988,7 +990,8 @@ IOStatus ZonedBlockDevice::SwitchWALZone() {
 }
 
 IOStatus ZonedBlockDevice::ResetUnusedWALZones() {
-  for (decltype(wal_zones_.size()) i = 0; i < wal_zones_.size(); ++i) {
+  decltype(wal_zones_.size()) i = 0;
+  for (i = 0; i < wal_zones_.size(); ++i) {
     if (i == active_wal_zone_) {
       continue;
     }
@@ -996,6 +999,31 @@ IOStatus ZonedBlockDevice::ResetUnusedWALZones() {
     if (wal_zones_[i]->Acquire()) {
       if (!z->IsEmpty() && !z->IsUsed()) {
         ZnsLog(kBlue, "[kqh] ResetUnusedWALZones: reset zone(%s)\n",
+               z->ToString().c_str());
+        bool full = z->IsFull();
+        IOStatus reset_status = z->Reset();
+        IOStatus release_status = z->CheckRelease();
+        if (!release_status.ok()) return release_status;
+        if (!full) PutActiveIOZoneToken();
+      } else {
+        IOStatus release_status = z->CheckRelease();
+        if (!release_status.ok()) return release_status;
+      }
+    }
+  }
+  return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::ResetUnusedKeySSTZones() {
+  decltype(key_sst_zones_.size()) i = 0;
+  for (i = 0; i < key_sst_zones_.size(); ++i) {
+    if (i == active_aggr_keysst_zone_) {
+      continue;
+    }
+    auto z = key_sst_zones_[i];
+    if (z->Acquire()) {
+      if (!z->IsEmpty() && !z->IsUsed()) {
+        ZnsLog(kBlue, "[kqh] ResetUnusedKeySSTZones: reset zone(%s)\n",
                z->ToString().c_str());
         bool full = z->IsFull();
         IOStatus reset_status = z->Reset();
@@ -1155,11 +1183,91 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
   return IOStatus::OK();
 }
 
-IOStatus ZonedBlockDevice::AllocateKeySSTZone(Zone **out_zone, KeySSTZoneAllocationHint *hint) {
+IOStatus ZonedBlockDevice::AllocateKeySSTZone(Zone **out_zone,
+                                              KeySSTZoneAllocationHint *hint) {
+  assert(hint->level_ >= 0);
+  ZnsLog(kGreen, "[kqh] AllocateKeySSTZone(size=%u level=%d)", hint->size_,
+         hint->level_);
+
+  // Not aggregated levels
+  if (!IsAggregatedLevel(hint->level_)) {
+    *out_zone = key_sst_zones_.back();
+    (*out_zone)->LoopForAcquire();
+    return IOStatus::OK();
+  }
+
+  // For aggregated levels:
+  Zone *ret_zone = nullptr;
+  while (true) {
+    auto old_active_aggr_keysst_zone = active_aggr_keysst_zone_;
+    ret_zone = key_sst_zones_[old_active_aggr_keysst_zone];
+    ret_zone->LoopForAcquire();
+
+    // After acquiring the ownership of this zone, another might have
+    // already changed the active key sst zone, thus a double check is
+    // needed to detect such case
+    if (old_active_aggr_keysst_zone != active_aggr_keysst_zone_) {
+      ret_zone->CheckRelease();
+      continue;
+    }
+
+    // if (ret_zone->GetCapacityLeft() >= hint->size_) {
+    if (ret_zone->GetCapacityLeft() >= (4UL * (1UL << 20))) {
+      ZnsLog(kDefault, "[xzw] Zone %d: capacity: %lu, allocation size: %lu\n",
+             ret_zone->ZoneId(), ret_zone->GetCapacityLeft(), hint->size_);
+      break;
+    }
+
+    // TODO: Do file migration on current active key sst zone
+    auto s = MigrateAggregatedLevelZone();
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  *out_zone = ret_zone;
+
+  ZnsLog(kGreen, "[kqh] Return Zone (%d)", (*out_zone)->ZoneId());
   return IOStatus::OK();
 }
 
-IOStatus ZonedBlockDevice::AllocateValueSSTZone(Zone **out_zone, ValueSSTZoneAllocationHint *hint) {
+IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
+  assert(zenfs_ != nullptr);
+  auto src_zone = key_sst_zones_[active_aggr_keysst_zone_];
+
+  if (src_zone->IsEmpty()) {
+    ZnsLog(Color::kDefault, "[xzw] Migration skipped zone %d\n",
+           src_zone->ZoneId());
+    return IOStatus::OK();
+  }
+
+  assert(src_zone->IsBusy());
+  auto next_zone = (active_aggr_keysst_zone_ + 1) % 2;
+  auto dst_zone = key_sst_zones_[next_zone];
+
+  ZnsLog(Color::kBlue, "[xzw] Migrating from zone %d to zone %d\n",
+         src_zone->ZoneId(), dst_zone->ZoneId());
+  auto s = zenfs_->MigrateAggregatedLevelZone(src_zone, dst_zone);
+  src_zone->CheckRelease();
+  ZnsLog(Color::kBlue, "[xzw] Migration finished\n", src_zone->ZoneId(),
+         dst_zone->ZoneId());
+
+  if (!s.ok()) {
+    return s;
+  }
+  active_aggr_keysst_zone_ = (active_aggr_keysst_zone_ + 1) % 2;
+
+  ZnsLog(Color::kRed, "Updating active_aggr_keysst_zone_ to %d in superblock\n",
+         active_aggr_keysst_zone_);
+  s = ResetUnusedKeySSTZones();
+  if (!s.ok()) {
+    return s;
+  }
+
+  return IOStatus::OK();
+}
+
+IOStatus ZonedBlockDevice::AllocateValueSSTZone(
+    Zone **out_zone, ValueSSTZoneAllocationHint *hint) {
   return IOStatus::OK();
 }
 
