@@ -31,7 +31,10 @@
 //    `NoZenFSMetrics`)
 
 #pragma once
+#include <sstream>
 #include "rocksdb/env.h"
+
+#include "log.h"
 namespace ROCKSDB_NAMESPACE {
 
 class ZenFSMetricsGuard;
@@ -187,6 +190,42 @@ struct ZenFSMetricsLatencyGuard {
   // overwrite this function if you do not intend to report delays measured in
   // microseconds.
   virtual uint64_t Report(uint64_t time) { return time; }
+};
+
+// ====================================================================
+//  Our own metrics and related structs
+//
+// ====================================================================
+
+enum XZenFSMetricsType {
+  kKeySST,
+  kValueSST,
+};
+
+struct XZenFSMetrics {
+  uint64_t value_sst_write_in_bytes = 0;
+  uint64_t key_sst_write_in_bytes = 0;
+
+public:
+  XZenFSMetrics() = default;
+
+  void RecordWriteBytes(uint64_t size, XZenFSMetricsType type) {
+    switch (type) {
+      case kValueSST: 
+        value_sst_write_in_bytes += size;
+        break;
+      case kKeySST: 
+        key_sst_write_in_bytes += size;
+        break;
+    }
+  }
+
+  std::string SummarizeAsString() const {
+    std::stringstream ss;
+    ss << "[Key SST Write Bytes : " << ToMiB(key_sst_write_in_bytes) << "MiB]"
+       << "[Value SST Write Bytes :" << ToMiB(value_sst_write_in_bytes) << "MiB]";
+    return ss.str();
+  }
 };
 
 #define ZENFS_LABEL(label, type) ZENFS_##label##_##type

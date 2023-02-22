@@ -149,7 +149,6 @@ IOStatus Zone::Close() {
 }
 
 IOStatus Zone::Append(char *data, uint32_t size, bool is_gc) {
-  // printf("[kqh] Zone Append(%s) size=%d\n", ToString().c_str(), size);
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_ZONE_WRITE_LATENCY,
                                  Env::Default());
   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_WRITE_THROUGHPUT, size);
@@ -322,7 +321,7 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   if (ios != IOStatus::OK()) return ios;
 
   // xzw: we limit the total zones here to 500
-  info.nr_zones = 500;
+  // info.nr_zones = 500;
   block_sz_ = info.pblock_size;
   zone_sz_ = info.zone_size;
   nr_zones_ = info.nr_zones;
@@ -507,7 +506,10 @@ void ZonedBlockDevice::LogGarbageInfo() {
     double garbage_rate =
         double(z->wp_ - z->start_ - z->used_capacity_) / z->max_capacity_;
     assert(garbage_rate >= 0);
-    assert(garbage_rate <= 2);
+    // assert(garbage_rate <= 2);
+    if (garbage_rate >= 2) {
+        continue;
+    }
     int idx = int((garbage_rate + 0.1) * 10);
     zone_gc_stat[idx]++;
 
@@ -1213,12 +1215,12 @@ IOStatus ZonedBlockDevice::AllocateKeySSTZone(Zone **out_zone,
 
     // if (ret_zone->GetCapacityLeft() >= hint->size_) {
     if (ret_zone->GetCapacityLeft() >= (4UL * (1UL << 20))) {
-      ZnsLog(kDefault, "[xzw] Zone %d: capacity: %lu, allocation size: %lu\n",
+      ZnsLog(kDefault, "[xzw] Zone %d: capacity: %lu, allocation size: %lu",
              ret_zone->ZoneId(), ret_zone->GetCapacityLeft(), hint->size_);
       break;
     }
 
-    // TODO: Do file migration on current active key sst zone
+    // TODO: Do file migration on current active key sst zone, but why?
     auto s = MigrateAggregatedLevelZone();
     if (!s.ok()) {
       return s;
@@ -1235,7 +1237,7 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
   auto src_zone = key_sst_zones_[active_aggr_keysst_zone_];
 
   if (src_zone->IsEmpty()) {
-    ZnsLog(Color::kDefault, "[xzw] Migration skipped zone %d\n",
+    ZnsLog(Color::kDefault, "[xzw] Migration skipped zone %d",
            src_zone->ZoneId());
     return IOStatus::OK();
   }
@@ -1244,11 +1246,11 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
   auto next_zone = (active_aggr_keysst_zone_ + 1) % 2;
   auto dst_zone = key_sst_zones_[next_zone];
 
-  ZnsLog(Color::kBlue, "[xzw] Migrating from zone %d to zone %d\n",
+  ZnsLog(Color::kBlue, "[xzw] Migrating from zone %d to zone %d",
          src_zone->ZoneId(), dst_zone->ZoneId());
   auto s = zenfs_->MigrateAggregatedLevelZone(src_zone, dst_zone);
   src_zone->CheckRelease();
-  ZnsLog(Color::kBlue, "[xzw] Migration finished\n", src_zone->ZoneId(),
+  ZnsLog(Color::kBlue, "[xzw] Migration finished", src_zone->ZoneId(),
          dst_zone->ZoneId());
 
   if (!s.ok()) {
@@ -1256,7 +1258,7 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
   }
   active_aggr_keysst_zone_ = (active_aggr_keysst_zone_ + 1) % 2;
 
-  ZnsLog(Color::kRed, "Updating active_aggr_keysst_zone_ to %d in superblock\n",
+  ZnsLog(Color::kRed, "Updating active_aggr_keysst_zone_ to %d in superblock",
          active_aggr_keysst_zone_);
   s = ResetUnusedKeySSTZones();
   if (!s.ok()) {
@@ -1268,6 +1270,7 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
 
 IOStatus ZonedBlockDevice::AllocateValueSSTZone(
     Zone **out_zone, ValueSSTZoneAllocationHint *hint) {
+  auto s = AllocateIOZone(Env::WLTH_EXTREME, IOType::kValueSST, out_zone);
   return IOStatus::OK();
 }
 

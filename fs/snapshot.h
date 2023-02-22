@@ -113,6 +113,8 @@ class ZenFSSnapshot {
   std::vector<ZoneSnapshot> zones_;
   std::vector<ZoneFileSnapshot> zone_files_;
   std::vector<ZoneExtentSnapshot> extents_;
+
+  std::string summarize_info_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -131,6 +131,11 @@ class ZoneFile {
            GetLevel() != -1;
   }
 
+  bool IsValueSST() const {
+    return (io_type_ == IOType::kFlushFile || io_type_ == IOType::kCompactionOutputFile) && 
+          GetLevel() == -1;
+  }
+
   uint32_t GetBlockSize() { return zbd_->GetBlockSize(); }
   ZonedBlockDevice* GetZbd() { return zbd_; }
   std::vector<ZoneExtent*> GetExtents() { return extents_; }

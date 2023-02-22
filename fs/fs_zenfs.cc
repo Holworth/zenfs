@@ -1684,6 +1684,8 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
   if (options.log_garbage_) {
     zbd_->LogGarbageInfo();
   }
+
+  snapshot.summarize_info_ = zbd_->GetXMetrics()->SummarizeAsString();
 }
 
 IOStatus ZenFS::MigrateExtents(

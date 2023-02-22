@@ -240,7 +240,9 @@ class ZonedBlockDevice {
   unsigned int max_nr_active_io_zones_;
   unsigned int max_nr_open_io_zones_;
 
+  // Some metrics
   std::shared_ptr<ZenFSMetrics> metrics_;
+  std::shared_ptr<XZenFSMetrics> x_metrics_ = std::make_shared<XZenFSMetrics>();
 
   void EncodeJsonZone(std::ostream &json_stream,
                       const std::vector<Zone *> zones);
@@ -334,6 +336,7 @@ class ZonedBlockDevice {
   void SetZoneDeferredStatus(IOStatus status);
 
   std::shared_ptr<ZenFSMetrics> GetMetrics() { return metrics_; }
+  std::shared_ptr<XZenFSMetrics> GetXMetrics() { return x_metrics_; }
 
   void GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot);
 
@@ -352,15 +355,12 @@ class ZonedBlockDevice {
 
   void GetZonesForKeySSTAllocation() {
     // Always use 3 zones preceding wal zones for KeySST allocation
-    io_zones[2]->capacity_ /= 100;
-    io_zones[3]->capacity_ /= 100;
-    io_zones[4]->capacity_ /= 100;
     key_sst_zones_.push_back(io_zones[2]);
     key_sst_zones_.push_back(io_zones[3]);
     key_sst_zones_.push_back(io_zones[4]);
 
-    // (kqh): For simplicity, we use the first zone for storing aggr levels
     // (xzw): should restore the correct active zone
+    // (kqh): Continue writing the zone that has been written already
     active_aggr_keysst_zone_ = io_zones[2]->IsEmpty() ? 1 : 0;
   }
 

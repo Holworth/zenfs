@@ -784,6 +784,8 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
     s = active_zone_->Append((char*)data + offset, wr_size);
     if (!s.ok()) return s;
 
+    if (IsValueSST()) zbd_->GetXMetrics()->RecordWriteBytes(wr_size, kValueSST);
+
     file_size_ += wr_size;
     left -= wr_size;
     offset += wr_size;
