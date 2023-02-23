@@ -462,7 +462,7 @@ class ZenFS : public FileSystemWrapper {
   IOStatus MigrateFileExtents(
       const std::string& fname,
       const std::vector<ZoneExtentSnapshot*>& migrate_exts,
-      Zone* dest_zone = nullptr);
+      Zone* dest_zone = nullptr, uint64_t* migrate_size = nullptr);
 
   IOStatus MigrateFileExtentsWithFSLock(
       const std::string& fname,

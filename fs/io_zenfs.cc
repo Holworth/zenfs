@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -86,8 +87,8 @@ void ZoneFile::EncodeTo(std::string* output, uint32_t extent_start) {
   PutFixed32(output, kFileType);
   PutFixed64(output, uint64_t(io_type_));
 
-  ZnsLog(Color::kBlue, ">>>>> xzw >>>>> encoding level %lu of file %lu\n",
-         level_, file_id_);
+  // ZnsLog(Color::kBlue, ">>>>> xzw >>>>> encoding level %lu of file %lu\n",
+  //        level_, file_id_);
 
   PutFixed32(output, kFileSize);
   PutFixed64(output, file_size_);
@@ -164,17 +165,18 @@ Status ZoneFile::DecodeFrom(Slice* input) {
       case kFileLevel:
         if (!GetFixed64(input, &level_))
           return Status::Corruption("ZoneFile", "Missing file level");
-        ZnsLog(Color::kBlue, ">>>>> xzw >>>>> decoding level %lu of file %lu\n",
-               level_, file_id_);
+        // ZnsLog(Color::kBlue, ">>>>> xzw >>>>> decoding level %lu of file
+        // %lu\n",
+        //        level_, file_id_);
         break;
       case kFileType: {
         uint64_t tmp = 0;
         if (!GetFixed64(input, &tmp))
           return Status::Corruption("ZoneFile", "Missing file type");
         io_type_ = static_cast<IOType>(tmp);
-        ZnsLog(Color::kBlue,
-               ">>>>> xzw >>>>> decoding level %lu and type %lu of file %lu\n",
-               level_, uint64_t(io_type_), file_id_);
+        // ZnsLog(Color::kBlue,
+        //        ">>>>> xzw >>>>> decoding level %lu and type %lu of file
+        //        %lu\n", level_, uint64_t(io_type_), file_id_);
         break;
       }
 
@@ -561,6 +563,9 @@ IOStatus ZoneFile::AllocateNewZoneForWrite(size_t size) {
 IOStatus ZoneFile::BufferedAppendAtomic(char* buffer, uint32_t data_size) {
   WriteLock lck(this);
 
+  ZnsLog(kGreen, "[File %s] call BufferedAppendAtomic (size=%llu)",
+         GetFilename().c_str(), data_size);
+
   uint32_t wr_size = data_size;
   uint32_t block_sz = GetBlockSize();
   IOStatus s;
@@ -636,7 +641,7 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
     uint64_t extent_length = wr_size;
 
     ZnsLog(
-        kDisableLog,
+        kCyan,
         "[kqh] File(%s) BufferedAppend %lf MiB to Zone(%d), FileSize %lf MiB",
         GetFilename().c_str(), ToMiB(wr_size + pad_sz), active_zone_->ZoneId(),
         ToMiB(file_size_));
@@ -796,6 +801,9 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
 
 IOStatus ZoneFile::AppendAtomic(void* buffer, int data_size) {
   WriteLock lck(this);
+
+  ZnsLog(kRed, "[File %s] call AppendAtomic (size=%llu)", GetFilename().c_str(),
+         data_size);
 
   uint32_t left = data_size;
   uint32_t wr_size = left, offset = 0;
@@ -1029,7 +1037,20 @@ ZonedWritableFile::ZonedWritableFile(ZonedBlockDevice* zbd, bool _buffered,
       buffer_sz = sparse_buffer_sz - ZoneFile::SPARSE_HEADER_SIZE - block_sz;
       buffer = sparse_buffer + ZoneFile::SPARSE_HEADER_SIZE;
     } else {
-      buffer_sz = 1024 * 1024;
+      // buffer_sz = 1024 * 1024;
+      // (kqh) Modify buffer size here so that one SSTable can be written
+      // atomically
+      if (zoneFile->IsValueSST()) {
+        buffer_sz = 64 * 1024 * 1024;
+      } else if (zoneFile->IsKeySST()) {
+        buffer_sz = 32 * 1024 * 1024;
+      } else {
+        buffer_sz = 1024 * 1024;
+      }
+
+      ZnsLog(kRed, "[File %s Create buffer of size %llu]",
+             zoneFile->GetFilename().c_str(), buffer_sz);
+
       int ret =
           posix_memalign((void**)&buffer, sysconf(_SC_PAGESIZE), buffer_sz);
 
@@ -1069,6 +1090,8 @@ IOStatus ZonedWritableFile::DataSync() {
   if (buffered) {
     IOStatus s;
     buffer_mtx_.lock();
+    ZnsLog(kRed, "[ZonedWritableFile::DataSync()] %s",
+           zoneFile_->GetFilename().c_str());
     /* Flushing the buffer will result in a new extent added to the list*/
     s = FlushBuffer();
     buffer_mtx_.unlock();
@@ -1178,10 +1201,7 @@ IOStatus ZonedWritableFile::BufferedWrite(const Slice& slice) {
       buffer_left = buffer_sz;
     }
 
-    to_buffer = data_left;
-    if (to_buffer > buffer_left) {
-      to_buffer = buffer_left;
-    }
+    to_buffer = std::min(buffer_left, data_left);
 
     memcpy(buffer + buffer_pos, data, to_buffer);
     buffer_pos += to_buffer;

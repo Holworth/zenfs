@@ -1075,7 +1075,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
     }
   }
 
-  ZnsLog(Color::kBlue, "[xzw] Start Allocate IO Zone, tid=%d\n",
+  ZnsLog(Color::kBlue, "[xzw] Start Allocate IO Zone, tid=%d",
          (std::this_thread::get_id()));
 
   WaitForOpenIOZoneToken(io_type == IOType::kWAL);
@@ -1188,13 +1188,14 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
 IOStatus ZonedBlockDevice::AllocateKeySSTZone(Zone **out_zone,
                                               KeySSTZoneAllocationHint *hint) {
   assert(hint->level_ >= 0);
-  ZnsLog(kGreen, "[kqh] AllocateKeySSTZone(size=%u level=%d)", hint->size_,
+  ZnsLog(kGreen, "[kqh] AllocateKeySSTZone (size=%u level=%d)", hint->size_,
          hint->level_);
 
   // Not aggregated levels
   if (!IsAggregatedLevel(hint->level_)) {
     *out_zone = key_sst_zones_.back();
     (*out_zone)->LoopForAcquire();
+    ZnsLog(kGreen, "AllocateKeySSTZone: return Zone%d", (*out_zone)->ZoneId());
     return IOStatus::OK();
   }
 
@@ -1228,7 +1229,7 @@ IOStatus ZonedBlockDevice::AllocateKeySSTZone(Zone **out_zone,
   }
   *out_zone = ret_zone;
 
-  ZnsLog(kGreen, "[kqh] Return Zone (%d)", (*out_zone)->ZoneId());
+  ZnsLog(kGreen, "AllocateKeySSTZone: Return Zone%d", (*out_zone)->ZoneId());
   return IOStatus::OK();
 }
 
@@ -1270,6 +1271,7 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
 
 IOStatus ZonedBlockDevice::AllocateValueSSTZone(
     Zone **out_zone, ValueSSTZoneAllocationHint *hint) {
+  ZnsLog(kGreen, "[kqh] Allocate Value SST");
   auto s = AllocateIOZone(Env::WLTH_EXTREME, IOType::kValueSST, out_zone);
   return IOStatus::OK();
 }

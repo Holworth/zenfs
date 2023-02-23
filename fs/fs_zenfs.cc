@@ -542,7 +542,7 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
 
     Info(logger_, "[kqh] Delete Files Internal: %s FileSize=%zu\n",
          fname.c_str(), zoneFile->GetFileSize());
-    printf("[kqh] Delete Files Internal: %s FileSize=%zu\n", fname.c_str(),
+    ZnsLog(kRed, "[kqh] Delete Files Internal: %s FileSize=%zu\n", fname.c_str(),
            zoneFile->GetFileSize());
 
     if (zoneFile->IsOpenForWR())
@@ -621,7 +621,7 @@ IOStatus ZenFS::NewWritableFile(const std::string& filename,
   Debug(logger_, "New writable file: %s direct: %d\n", fname.c_str(),
         file_opts.use_direct_writes);
 
-  Info(logger_, "New writable file: %s direct: %d\n", fname.c_str(),
+  ZnsLog(kCyan, "New writable file: %s direct: %d", fname.c_str(),
        file_opts.use_direct_writes);
 
   return OpenWritableFile(fname, file_opts, result, nullptr, false);
@@ -838,8 +838,8 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
       zoneFile->SetSparse(!file_opts.use_direct_writes);
     } else {
       zoneFile->SetIOType(file_opts.io_options.type);
-      printf("[kqh] Set ZoneFile(%s) Type: %s\n", filename.c_str(),
-             IOTypeToString(zoneFile->GetIOType()).c_str());
+      ZnsLog(kRed, "[kqh] Set ZoneFile(%s) Type: %s, Level(%d)", filename.c_str(),
+             IOTypeToString(zoneFile->GetIOType()).c_str(), zoneFile->GetLevel());
     }
 
     /* Persist the creation of the file */
@@ -1870,6 +1870,10 @@ IOStatus ZenFS::MigrateAggregatedLevelZone(Zone* src_zone, Zone* dst_zone) {
   assert(src_zone->IsBusy());
   IOStatus s;
 
+  uint64_t total_migrate_size = 0;
+  ZnsLog(kBlue, "[Before Migrate][Zone %d used capacity = %llu]", 
+          src_zone->ZoneId(), src_zone->used_capacity_.load());
+
   std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
   s = GetAggrLevelZoneExtents(&file_extents, src_zone);
 
@@ -1892,13 +1896,17 @@ IOStatus ZenFS::MigrateAggregatedLevelZone(Zone* src_zone, Zone* dst_zone) {
     // We avoid this case by prohibiting a key sst being written twice. All its 
     // content must be packed into one AppendAtomic call. 
     // 
-    s = MigrateFileExtents(it.first, it.second, dst_zone);
+    uint64_t migrate_size = 0;
+    s = MigrateFileExtents(it.first, it.second, dst_zone, &migrate_size);
     if (!s.ok()) {
       release_mem();
       return s;
     }
+    total_migrate_size += migrate_size;
   }
   release_mem();
+  ZnsLog(kBlue, "[After Migrate][Zone %d used capacity = %llu][Migrate Size = %llu]", 
+    src_zone->ZoneId(), src_zone->used_capacity_.load(), total_migrate_size);
   return IOStatus::OK();
 }
 
@@ -1993,7 +2001,11 @@ IOStatus ZenFS::MigrateFileExtentsWithFSLock(
 // Migrate a given file and associated migration extents
 IOStatus ZenFS::MigrateFileExtents(
     const std::string& fname,
-    const std::vector<ZoneExtentSnapshot*>& migrate_exts, Zone* dest_zone) {
+    const std::vector<ZoneExtentSnapshot*>& migrate_exts, Zone* dest_zone, 
+    uint64_t* migrate_size) {
+
+  uint64_t migrate_data_size = 0;
+  
   IOStatus s = IOStatus::OK();
   Info(logger_, "MigrateFileExtents, fname: %s, extent count: %lu",
        fname.data(), migrate_exts.size());
@@ -2064,12 +2076,13 @@ IOStatus ZenFS::MigrateFileExtents(
                          target_zone);
     } else {
       zfile->MigrateData(ext->start_, ext->length_, target_zone);
+      migrate_data_size += ext->length_;
     }
 
     // If the file doesn't exist, skip
     if (GetFileNoLock(fname) == nullptr) {
       Info(logger_, "Migrate(%s) file not exist anymore.", fname.c_str());
-      printf("[kqh] Migrate file(%s) not exist anymore.", fname.c_str());
+      ZnsLog(kRed, "[kqh] Migrate file(%s) not exist anymore.", fname.c_str());
       zbd_->ReleaseMigrateZone(target_zone);
       break;
     }
@@ -2082,6 +2095,9 @@ IOStatus ZenFS::MigrateFileExtents(
   }
 
   SyncFileExtents(zfile.get(), new_extent_list);
+  if (migrate_size) {
+    *migrate_size = migrate_data_size;
+  }
 
   Info(logger_, "MigrateFileExtents Finished, fname: %s, extent count: %lu",
        fname.data(), migrate_exts.size());

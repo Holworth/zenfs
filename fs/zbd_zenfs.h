@@ -355,6 +355,9 @@ class ZonedBlockDevice {
 
   void GetZonesForKeySSTAllocation() {
     // Always use 3 zones preceding wal zones for KeySST allocation
+    // io_zones[2]->capacity_ /= 100;
+    // io_zones[3]->capacity_ /= 100;
+    // io_zones[4]->capacity_ /= 100;
     key_sst_zones_.push_back(io_zones[2]);
     key_sst_zones_.push_back(io_zones[3]);
     key_sst_zones_.push_back(io_zones[4]);
