@@ -542,7 +542,7 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
 
     Info(logger_, "[kqh] Delete Files Internal: %s FileSize=%zu\n",
          fname.c_str(), zoneFile->GetFileSize());
-    ZnsLog(kRed, "[kqh] Delete Files Internal: %s FileSize=%zu\n", fname.c_str(),
+    ZnsLog(kGreen, "[kqh] Delete Files Internal: %s FileSize=%zu\n", fname.c_str(),
            zoneFile->GetFileSize());
 
     if (zoneFile->IsOpenForWR())

@@ -31,10 +31,13 @@
 //    `NoZenFSMetrics`)
 
 #pragma once
+#include <atomic>
+#include <chrono>
+#include <fstream>
 #include <sstream>
-#include "rocksdb/env.h"
 
 #include "log.h"
+#include "rocksdb/env.h"
 namespace ROCKSDB_NAMESPACE {
 
 class ZenFSMetricsGuard;
@@ -198,33 +201,137 @@ struct ZenFSMetricsLatencyGuard {
 // ====================================================================
 
 enum XZenFSMetricsType {
+  kTotal,
+  kWAL,
   kKeySST,
   kValueSST,
+  kGCMigrate,
+  kGCWrite,
 };
 
+// A thread-safe metrics
 struct XZenFSMetrics {
-  uint64_t value_sst_write_in_bytes = 0;
-  uint64_t key_sst_write_in_bytes = 0;
+  static const uint64_t kRecordIntervalMs = 1000;
+  static const uint64_t kMaxHistCount = 10000;
 
-public:
-  XZenFSMetrics() = default;
+  std::array<std::atomic<uint64_t>, kMaxHistCount> wal_write_bytes_hist;
+  std::array<std::atomic<uint64_t>, kMaxHistCount> value_sst_write_bytes_hist;
+  std::array<std::atomic<uint64_t>, kMaxHistCount> key_sst_write_bytes_hist;
+  std::array<std::atomic<uint64_t>, kMaxHistCount>
+      gc_migrate_sst_write_bytes_hist;
+  std::array<std::atomic<uint64_t>, kMaxHistCount> gc_new_sst_write_bytes_hist;
+  std::array<std::atomic<uint64_t>, kMaxHistCount> zns_write_bytes_hist;
+
+  std::atomic<uint64_t> wal_write_bytes_total;
+  std::atomic<uint64_t> value_sst_write_bytes_total;
+  std::atomic<uint64_t> key_sst_write_bytes_total;
+  std::atomic<uint64_t> gc_migrate_sst_write_bytes_total;
+  std::atomic<uint64_t> gc_new_sst_write_bytes_total;
+  std::atomic<uint64_t> zns_write_bytes_total;
+
+  decltype(std::chrono::steady_clock::now()) start_time_point;
+
+ public:
+  XZenFSMetrics()
+      : wal_write_bytes_total(0),
+        value_sst_write_bytes_total(0),
+        key_sst_write_bytes_total(0),
+        gc_migrate_sst_write_bytes_total(0),
+        gc_new_sst_write_bytes_total(0),
+        zns_write_bytes_total(0),
+        start_time_point(std::chrono::steady_clock::now()) {
+    for (uint64_t i = 0; i < kMaxHistCount; ++i) {
+      wal_write_bytes_hist[i].store(0);
+      key_sst_write_bytes_hist[i].store(0);
+      value_sst_write_bytes_hist[i].store(0);
+      gc_migrate_sst_write_bytes_hist[i].store(0);
+      gc_new_sst_write_bytes_hist[i].store(0);
+      zns_write_bytes_hist[i].store(0);
+    }
+  }
+
+  // Dump when destructed
+  ~XZenFSMetrics() { Dump(""); }
 
   void RecordWriteBytes(uint64_t size, XZenFSMetricsType type) {
+    auto elapse_time = ElapseTime();
+    auto index = elapse_time / kRecordIntervalMs;
     switch (type) {
-      case kValueSST: 
-        value_sst_write_in_bytes += size;
+      case kWAL:
+        wal_write_bytes_hist[index] += size;
+        wal_write_bytes_total += size;
         break;
-      case kKeySST: 
-        key_sst_write_in_bytes += size;
+      case kKeySST:
+        key_sst_write_bytes_hist[index] += size;
+        key_sst_write_bytes_total += size;
         break;
+      case kValueSST:
+        value_sst_write_bytes_hist[index] += size;
+        value_sst_write_bytes_total += size;
+        break;
+      case kGCMigrate:
+        gc_migrate_sst_write_bytes_hist[index] += size;
+        gc_migrate_sst_write_bytes_total += size;
+        break;
+      case kGCWrite:
+        gc_new_sst_write_bytes_hist[index] += size;
+        gc_new_sst_write_bytes_total += size;
+        break;
+      case kTotal:
+        zns_write_bytes_hist[index] += size;
+        zns_write_bytes_total += size;
+        break;
+      default:
+        assert(false);
     }
+  }
+
+  uint64_t ElapseTime() {
+    auto time_now = std::chrono::steady_clock::now();
+    auto dura = std::chrono::duration_cast<std::chrono::milliseconds>(
+        time_now - start_time_point);
+    return dura.count();
   }
 
   std::string SummarizeAsString() const {
     std::stringstream ss;
-    ss << "[Key SST Write Bytes : " << ToMiB(key_sst_write_in_bytes) << "MiB]"
-       << "[Value SST Write Bytes :" << ToMiB(value_sst_write_in_bytes) << "MiB]";
+    ss << "[Key SST Write Bytes : " << ToMiB(key_sst_write_bytes_total)
+       << "MiB]"
+       << "[Value SST Write Bytes :" << ToMiB(value_sst_write_bytes_total)
+       << "MiB]"
+       << "[GC Migrate Write Bytes :" << ToMiB(gc_migrate_sst_write_bytes_total)
+       << "MiB]"
+       << "[ZNS Write Bytes : " << ToMiB(zns_write_bytes_total) << "MiB]";
     return ss.str();
+  }
+
+  void Dump(const std::string& filename_prefix) {
+    auto end_index = ElapseTime() / kRecordIntervalMs;
+
+    DumpSingleHist(filename_prefix + "wal_write_bytes_hist",
+                   wal_write_bytes_hist, end_index);
+    DumpSingleHist(filename_prefix + "value_sst_write_bytes_hist",
+                   value_sst_write_bytes_hist, end_index);
+    DumpSingleHist(filename_prefix + "key_sst_write_bytes_hist",
+                   key_sst_write_bytes_hist, end_index);
+    DumpSingleHist(filename_prefix + "gc_migrate_sst_write_bytes_hist",
+                   gc_migrate_sst_write_bytes_hist, end_index);
+    DumpSingleHist(filename_prefix + "gc_new_sst_write_bytes_hist",
+                   gc_new_sst_write_bytes_hist, end_index);
+    DumpSingleHist(filename_prefix + "zns_write_bytes_hist",
+                   zns_write_bytes_hist, end_index);
+  }
+
+  void DumpSingleHist(
+      const std::string& filename,
+      const std::array<std::atomic<uint64_t>, kMaxHistCount>& data,
+      uint64_t end_index) {
+    std::ofstream of;
+    of.open(filename);
+    for (int i = 0; i < std::min(end_index, data.size()); ++i) {
+      of << data[i] << "\n";
+    }
+    of.close();
   }
 };
 

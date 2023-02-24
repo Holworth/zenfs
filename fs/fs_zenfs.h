@@ -206,6 +206,14 @@ class ZenFS : public FileSystemWrapper {
 
   Status RecoverFrom(ZenMetaLog* log);
 
+  std::shared_ptr<XZenFSMetrics> GetXMetrics() const {
+    return zbd_->GetXMetrics();
+  }
+
+  void Dump() override {
+    zbd_->GetXMetrics()->Dump("");
+  }
+
   std::string ToAuxPath(std::string path) {
     return superblock_->GetAuxFsPath() + path;
   }
