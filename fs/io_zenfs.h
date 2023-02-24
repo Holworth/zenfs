@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+
 #include "fs/metrics.h"
 #include "rocksdb/slice.h"
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
@@ -120,8 +121,11 @@ class ZoneFile {
   void SetFileSize(uint64_t sz);
   void ClearExtents();
 
+  // ============================================================================
+  // Project Modification
   // (xzw): level accessors
   // if the return level is -1, the file is not a KeySST
+  // ============================================================================
   uint64_t GetLevel() const;
   void SetLevel(uint64_t level);
 
@@ -132,9 +136,37 @@ class ZoneFile {
   }
 
   bool IsValueSST() const {
-    return (io_type_ == IOType::kFlushFile || io_type_ == IOType::kCompactionOutputFile) && 
-          GetLevel() == -1;
+    return (io_type_ == IOType::kFlushFile ||
+            io_type_ == IOType::kCompactionOutputFile) &&
+           GetLevel() == -1;
   }
+
+  bool IsGCOutputValueSST() const {
+    return (io_type_ == IOType::kCompactionOutputFile && GetLevel() == -1);
+  }
+
+  bool IsWAL() const { 
+    return io_type_ == IOType::kWAL;
+  }
+
+  // Record size of one write operation
+  void RecordWrite(uint64_t size) const {
+    if (IsKeySST()) {
+      zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kKeySST);
+    } else if (IsValueSST()) {
+      zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kValueSST);
+      if (IsGCOutputValueSST()) {
+        zbd_->GetXMetrics()->RecordWriteBytes(size,
+                                              XZenFSMetricsType::kGCWrite);
+      }
+    } else if (IsWAL()) {
+      zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kWAL);
+    }
+  }
+
+  // ============================================================================
+  //  Modification End
+  // ============================================================================
 
   uint32_t GetBlockSize() { return zbd_->GetBlockSize(); }
   ZonedBlockDevice* GetZbd() { return zbd_; }

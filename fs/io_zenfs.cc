@@ -585,6 +585,8 @@ IOStatus ZoneFile::BufferedAppendAtomic(char* buffer, uint32_t data_size) {
     return s;
   }
 
+  RecordWrite(wr_size + pad_sz);
+
   extents_.push_back(
       new ZoneExtent(extent_start_, extent_length, active_zone_));
   active_zone_->used_capacity_ += extent_length;
@@ -643,6 +645,8 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
 
     s = active_zone_->Append(buffer, wr_size + pad_sz);
     if (!s.ok()) return s;
+
+    RecordWrite(wr_size + pad_sz);
 
     extents_.push_back(
         new ZoneExtent(extent_start_, extent_length, active_zone_));
@@ -711,6 +715,8 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
 
     s = active_zone_->Append(sparse_buffer, wr_size + pad_sz);
     if (!s.ok()) return s;
+
+    RecordWrite(wr_size + pad_sz);
 
     extents_.push_back(
         new ZoneExtent(extent_start_ + ZoneFile::SPARSE_HEADER_SIZE,
@@ -784,7 +790,7 @@ IOStatus ZoneFile::Append(void* data, int data_size) {
     s = active_zone_->Append((char*)data + offset, wr_size);
     if (!s.ok()) return s;
 
-    if (IsValueSST()) zbd_->GetXMetrics()->RecordWriteBytes(wr_size, kValueSST);
+    RecordWrite(wr_size);
 
     file_size_ += wr_size;
     left -= wr_size;
@@ -811,6 +817,8 @@ IOStatus ZoneFile::AppendAtomic(void* buffer, int data_size) {
   if (!s.ok()) {
     return s;
   }
+
+  RecordWrite(wr_size);
 
   extents_.push_back(
       new ZoneExtent(extent_start_, extent_length, active_zone_));
@@ -1384,6 +1392,7 @@ IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
       return IOStatus::IOError(strerror(errno));
     }
     target_zone->Append(buf, r, true);
+    zbd_->GetXMetrics()->RecordWriteBytes(r, kGCMigrate);
     length -= read_sz;
     offset += r;
   }

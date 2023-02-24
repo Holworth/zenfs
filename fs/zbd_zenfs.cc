@@ -151,10 +151,10 @@ IOStatus Zone::Close() {
 IOStatus Zone::Append(char *data, uint32_t size, bool is_gc) {
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_ZONE_WRITE_LATENCY,
                                  Env::Default());
-  zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_WRITE_THROUGHPUT, size);
-  if (is_gc) {
-    zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_GC_WRITE_THROUGHPUT, size);
-  }
+  // zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_WRITE_THROUGHPUT, size);
+  // if (is_gc) {
+  //   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_GC_WRITE_THROUGHPUT, size);
+  // }
 
   char *ptr = data;
   uint32_t left = size;
@@ -183,6 +183,8 @@ IOStatus Zone::Append(char *data, uint32_t size, bool is_gc) {
 
     assert(wp_ <= start_ + max_capacity_);
   }
+
+  zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kTotal);
 
   return IOStatus::OK();
 }
