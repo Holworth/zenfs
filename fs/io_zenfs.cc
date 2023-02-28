@@ -338,9 +338,27 @@ IOStatus ZoneFile::CloseActiveZone() {
       return s;
     }
     zbd_->PutOpenIOZoneToken();
+    if (IsWAL()) {
+      zbd_->wal_zone_open_count_--;
+      ZnsLog(kMagenta, "WALOpenZoneCount(%d) WALActiveZoneCount(%d)",
+             zbd_->wal_zone_open_count_.load(),
+             zbd_->wal_zone_active_count_.load());
+    }
     if (full) {
       zbd_->PutActiveIOZoneToken();
+      if (IsWAL()) {
+        zbd_->wal_zone_active_count_--;
+        ZnsLog(kMagenta, "WALOpenZoneCount(%d) WALActiveZoneCount(%d)",
+               zbd_->wal_zone_open_count_.load(),
+               zbd_->wal_zone_active_count_.load());
+      }
     }
+  }
+  // Key SST should not hold a valid active zone when closed. KeySST only
+  // temporarily holds an active zone during an Append call and release this
+  // active zone immediately after this append is finished or error happens
+  if (IsKeySST()) {
+    assert(active_zone_ == nullptr);
   }
   return s;
 }
@@ -497,16 +515,17 @@ IOStatus ZoneFile::AllocateNewZone() {
 
   if (!s.ok()) return s;
   if (!zone) {
-    printf("[kqh] File(%s) Allocate Zone Failed\n", linkfiles_.front().c_str());
-    return IOStatus::NoSpace("Zone allocation failure\n");
+    ZnsLog(kRed, "[kqh] File(%s) Allocate Zone Failed",
+           linkfiles_.front().c_str());
+    return IOStatus::NoSpace("Zone allocation failure");
   }
   SetActiveZone(zone);
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = file_size_;
 
   if (!linkfiles_.empty()) {
-    printf("[kqh] File(%s) Allocate Zone(%s)\n", linkfiles_.front().c_str(),
-           zone->ToString().c_str());
+    ZnsLog(kGreen, "[kqh] File(%s) Allocate Zone(%s)",
+           linkfiles_.front().c_str(), zone->ToString().c_str());
   }
 
   /* Persist metadata so we can recover the active extent using
@@ -537,7 +556,7 @@ IOStatus ZoneFile::AllocateNewZoneForWrite(size_t size) {
         ValueSSTZoneAllocationHint hint;
         s = zbd_->AllocateValueSSTZone(&zone, &hint);
       } else {
-        KeySSTZoneAllocationHint hint(size, level_);
+        KeySSTZoneAllocationHint hint(size, level_, GetFilename());
         s = zbd_->AllocateKeySSTZone(&zone, &hint);
       }
       break;
@@ -586,7 +605,13 @@ IOStatus ZoneFile::BufferedAppendAtomic(char* buffer, uint32_t data_size) {
   }
 
   s = active_zone_->Append(buffer, wr_size + pad_sz);
+
+  // Release the active zone immediately if this write fails in case
+  // of deadlock occures upon this zone. For example, this function acquires
+  // the lock of the active_zone_ but fails to append data, then the zone must
+  // be released before this function returns
   if (!s.ok()) {
+    ReleaseActiveZone();
     return s;
   }
 
@@ -603,9 +628,7 @@ IOStatus ZoneFile::BufferedAppendAtomic(char* buffer, uint32_t data_size) {
       GetFilename().c_str(), data_size, ToMiB(file_size_),
       active_zone_->ZoneId());
 
-  // Release the active zone immediately
   ReleaseActiveZone();
-
   return IOStatus::OK();
 }
 
@@ -822,7 +845,13 @@ IOStatus ZoneFile::AppendAtomic(void* buffer, int data_size) {
   }
 
   s = active_zone_->Append((char*)buffer, wr_size);
+
+  // Release the active zone immediately if this write fails in case
+  // of deadlock occures upon this zone. For example, this function acquires
+  // the lock of the active_zone_ but fails to append data, then the zone must
+  // be released before this function returns
   if (!s.ok()) {
+    ReleaseActiveZone();
     return s;
   }
 
@@ -1382,7 +1411,7 @@ IOStatus ZoneFile::ReadData(uint64_t offset, uint32_t length, Slice* data) {
 // (kqh): TODO: May add throughput reporter here to record migration throughput
 IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
                                Zone* target_zone) {
-  ZnsLog(kBlue, "[kqh] Migrate Data: offset(%zu) len(%u) to ZoneId(%d)\n",
+  ZnsLog(kBlue, "[kqh] Migrate Data: offset(%zu) len(%u) to ZoneId(%d)",
          offset, length, target_zone->ZoneId());
 
   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_GC_READ_THROUGHPUT, length);

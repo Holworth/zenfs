@@ -4,6 +4,7 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <mutex>
@@ -542,8 +543,8 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
 
     Info(logger_, "[kqh] Delete Files Internal: %s FileSize=%zu\n",
          fname.c_str(), zoneFile->GetFileSize());
-    ZnsLog(kGreen, "[kqh] Delete Files Internal: %s FileSize=%zu\n", fname.c_str(),
-           zoneFile->GetFileSize());
+    ZnsLog(kGreen, "[kqh] Delete Files Internal: %s FileSize=%zu",
+           fname.c_str(), zoneFile->GetFileSize());
 
     if (zoneFile->IsOpenForWR())
       return IOStatus::Busy("ZenFS::DeleteFileNoLock(): file open for writing:",
@@ -622,7 +623,7 @@ IOStatus ZenFS::NewWritableFile(const std::string& filename,
         file_opts.use_direct_writes);
 
   ZnsLog(kCyan, "New writable file: %s direct: %d", fname.c_str(),
-       file_opts.use_direct_writes);
+         file_opts.use_direct_writes);
 
   return OpenWritableFile(fname, file_opts, result, nullptr, false);
 }
@@ -838,8 +839,9 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
       zoneFile->SetSparse(!file_opts.use_direct_writes);
     } else {
       zoneFile->SetIOType(file_opts.io_options.type);
-      ZnsLog(kRed, "[kqh] Set ZoneFile(%s) Type: %s, Level(%d)", filename.c_str(),
-             IOTypeToString(zoneFile->GetIOType()).c_str(), zoneFile->GetLevel());
+      ZnsLog(kRed, "[kqh] Set ZoneFile(%s) Type: %s, Level(%d)",
+             filename.c_str(), IOTypeToString(zoneFile->GetIOType()).c_str(),
+             zoneFile->GetLevel());
     }
 
     /* Persist the creation of the file */
@@ -1701,11 +1703,11 @@ IOStatus ZenFS::MigrateExtents(
     }
   }
 
-  // (kqh) Before migrating, first reset unused zones since one zone might
+  // Before migrating, first reset unused zones since one zone might
   // be full with garbage and no extents are in this zone
   s = zbd_->ResetUnusedIOZones();
   if (!s.ok()) {
-    printf("[MigrateExtents]: Reset UnusedIOZones Failed");
+    ZnsLog(kGCColor, "[GC][MigrateExtents]: Reset UnusedIOZones Failed");
     return s;
   }
 
@@ -1722,12 +1724,12 @@ IOStatus ZenFS::CompactZone(uint64_t zone_start,
                             const std::vector<ZoneExtentSnapshot*>& extents) {
   // (kqh) Should we wait for active zone for both compact zone and provisoning
   // zone?
-  printf("[kqh] Start Compact Zone\n");
+  ZnsLog(kGCColor, "[GC] Start Compact Zone\n");
   // zbd_->WaitForOpenIOZoneToken(true);
   IOStatus s;
   auto zone = zbd_->GetIOZone(zone_start);
   if (zone == nullptr || !zone->Acquire()) {
-    printf("[kqh] Target Zone Doese Not exist");
+    ZnsLog(kGCColor, "[GC] Target Zone Doese Not exist");
     zbd_->PutOpenIOZoneToken();
     return IOStatus::OK();
   }
@@ -1763,12 +1765,14 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
   // Lock the whole file system for simplicity
   std::lock_guard<std::mutex> lck(files_mtx_);
 
-  printf("[kqh] Before Migration: Zone(%s)\n", zone->ToString().c_str());
+  ZnsLog(kGCColor, "[GC] Before Migration: Zone(%s)\n",
+         zone->ToString().c_str());
 
   assert(zone->IsFull());
   IOStatus s = IOStatus::OK();
   Info(logger_, "[kqh] DoZoneCompaction Zone(%s)\n", zone->ToString().c_str());
-  printf("[kqh] DoZoneCompaction Zone(%s)\n", zone->ToString().c_str());
+  ZnsLog(kGCColor, "[GC] DoZoneCompaction Zone(%s)\n",
+         zone->ToString().c_str());
 
   auto target_zone = zbd_->GetProvisioningZone();
   if (!target_zone) {
@@ -1779,7 +1783,7 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
     zbd_->FinishCheapestIOZone();
   }
   // Allocate Open Zone token for target zone of migration
-  printf("[kqh] Increment open io zone in compact zone process: %ld\n",
+  ZnsLog(kGCColor, "[GC] Increment open io zone in compact zone process: %ld\n",
          zbd_->OpenIOZoneCount());
   zbd_->WaitForOpenIOZoneToken(false);
 
@@ -1792,7 +1796,7 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
 
   // First read all compact file extents data into buffer
   for (const auto& [fname, compact_exts] : extents_in_zone) {
-    printf("Read file extents: %s\n", fname.c_str());
+    ZnsLog(kGCColor, "[GC] Read file extents: %s\n", fname.c_str());
     auto zfile = GetFileNoLock(fname);
     if (zfile == nullptr) {
       continue;
@@ -1818,8 +1822,8 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
 
       if (it == compact_exts.end()) {
         Info(logger_, "Migrate extent not found, ext_start: %lu", ext->start_);
-        printf("Migrate extent [%s] not found, ext_start: %lu\n", fname.c_str(),
-               ext->start_);
+        ZnsLog(kGCColor, "[GC] Migrate extent [%s] not found, ext_start: %lu\n",
+               fname.c_str(), ext->start_);
         continue;
       }
 
@@ -1842,7 +1846,7 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
     SyncFileExtentsNoLock(zfile.get(), new_extent_list);
   }
 
-  printf("[kqh] Migrate Zone Done\n");
+  ZnsLog(kGCColor, "[GC] Migrate Zone Done\n");
 
   target_zone->lifetime_ = zone->lifetime_;
   zone->used_capacity_ = 0;
@@ -1859,8 +1863,8 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
   assert(t);
 
   zbd_->PutOpenIOZoneToken();
-  printf("[kqh] Release IO Token for migrating zone\n");
-  printf("[kqh] After migration: target zone: %s\n",
+  ZnsLog(kGCColor, "[GC] Release IO Token for migrating zone\n");
+  ZnsLog(kGCColor, "[GC] After migration: target zone: %s\n",
          target_zone->ToString().c_str());
 
   return IOStatus::OK();
@@ -1868,16 +1872,16 @@ IOStatus ZenFS::DoZoneCompaction(Zone* zone,
 
 IOStatus ZenFS::MigrateAggregatedLevelZone(Zone* src_zone, Zone* dst_zone) {
   assert(src_zone->IsBusy());
-  IOStatus s;
 
+  IOStatus s;
   uint64_t total_migrate_size = 0;
-  ZnsLog(kBlue, "[Before Migrate][Zone %d used capacity = %llu]", 
-          src_zone->ZoneId(), src_zone->used_capacity_.load());
+  ZnsLog(kBlue, "[Before Migrate][Zone %d used capacity = %llu]",
+         src_zone->ZoneId(), src_zone->used_capacity_.load());
 
   std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
   s = GetAggrLevelZoneExtents(&file_extents, src_zone);
 
-  // Release any heap memory
+  // Release any heap memory allocated in this scope.
   auto release_mem = [&]() {
     for (auto it : file_extents) {
       for (const auto& ext : it.second) {
@@ -1886,16 +1890,18 @@ IOStatus ZenFS::MigrateAggregatedLevelZone(Zone* src_zone, Zone* dst_zone) {
     }
   };
 
+  //
+  // One concern is that MigrateFileExtents function does not migrate a file
+  // that is being written (i.e. OpenForWR() is true). We might enter this
+  // function while there are some activated key sst whose extents are in the
+  // migrated zone. In such a circumstance, these extents will not be migrated
+  // and the old zone can not be released.
+  //
+  // We avoid this case by prohibiting a key sst being written more than
+  // twice. All its content must be packed into one (Buffered)AppendAtomic
+  // call.
+  //
   for (auto it : file_extents) {
-    // 
-    // One concern is that MigrateFileExtents function does not migrate a file 
-    // that is being written. We might enter this function while there are some
-    // activated key sst whose extents are in the migrated zone. In such a case, 
-    // these extents will not be migrated and the old zone can not be released. 
-    // 
-    // We avoid this case by prohibiting a key sst being written twice. All its 
-    // content must be packed into one AppendAtomic call. 
-    // 
     uint64_t migrate_size = 0;
     s = MigrateFileExtents(it.first, it.second, dst_zone, &migrate_size);
     if (!s.ok()) {
@@ -1905,8 +1911,10 @@ IOStatus ZenFS::MigrateAggregatedLevelZone(Zone* src_zone, Zone* dst_zone) {
     total_migrate_size += migrate_size;
   }
   release_mem();
-  ZnsLog(kBlue, "[After Migrate][Zone %d used capacity = %llu][Migrate Size = %llu]", 
-    src_zone->ZoneId(), src_zone->used_capacity_.load(), total_migrate_size);
+  ZnsLog(kBlue,
+         "[After Migrate][Zone %d used capacity = %llu][Migrate Size = %llu]",
+         src_zone->ZoneId(), src_zone->used_capacity_.load(),
+         total_migrate_size);
   return IOStatus::OK();
 }
 
@@ -1916,7 +1924,8 @@ IOStatus ZenFS::GetAggrLevelZoneExtents(
   std::lock_guard<std::mutex> file_lock(files_mtx_);
   for (const auto& file_it : files_) {
     ZoneFile& file = *(file_it.second);
-    if (file.IsKeySST() && file.GetLevel() < config::kAggrLevelThreshold) {
+    if (file.IsKeySST() &&
+        ZonedBlockDevice::IsAggregatedLevel(file.GetLevel())) {
       // extent -> file mapping
       assert(ends_with(file.GetFilename(), ".sst"));
       for (auto* ext : file.GetExtents()) {
@@ -1966,12 +1975,13 @@ IOStatus ZenFS::MigrateFileExtentsWithFSLock(
 
     if (it == migrate_exts.end()) {
       Info(logger_, "Migrate extent not found, ext_start: %lu", ext->start_);
-      ZnsLog(kDefault, "[kqh] Migrate extent not found, ext_start: %lu\n", ext->start_);
+      ZnsLog(kDefault, "[kqh] Migrate extent not found, ext_start: %lu\n",
+             ext->start_);
       continue;
     }
 
-    ZnsLog(kDefault, "[kqh] Migrate extent: length(%zu) zone(%s)\n", ext->length_,
-           ext->zone_->ToString().c_str());
+    ZnsLog(kDefault, "[kqh] Migrate extent: length(%zu) zone(%s)\n",
+           ext->length_, ext->zone_->ToString().c_str());
 
     Zone* target_zone = dest_zone;
     uint64_t target_start = target_zone->wp_;
@@ -2001,21 +2011,24 @@ IOStatus ZenFS::MigrateFileExtentsWithFSLock(
 // Migrate a given file and associated migration extents
 IOStatus ZenFS::MigrateFileExtents(
     const std::string& fname,
-    const std::vector<ZoneExtentSnapshot*>& migrate_exts, Zone* dest_zone, 
+    const std::vector<ZoneExtentSnapshot*>& migrate_exts, Zone* dest_zone,
     uint64_t* migrate_size) {
-
   uint64_t migrate_data_size = 0;
-  
+
   IOStatus s = IOStatus::OK();
   Info(logger_, "MigrateFileExtents, fname: %s, extent count: %lu",
        fname.data(), migrate_exts.size());
 
-  ZnsLog(kDefault, "[kqh] MigrateFileExtents, fname: %s, extent count: %lu\n",
+  ZnsLog(kGCColor, "[kqh] MigrateFileExtents, fname: %s, extent count: %lu",
          fname.data(), migrate_exts.size());
 
   // The file may be deleted by other threads, better double check.
   auto zfile = GetFile(fname);
   if (zfile == nullptr || zfile->IsOpenForWR()) {
+    // if (zfile && zfile->IsOpenForWR()) {
+    //   ZnsLog(kRed, "File (%s) IsOpenForWR, failed to migrate",
+    //          zfile->GetFilename().c_str());
+    // }
     return IOStatus::OK();
   }
 
@@ -2040,8 +2053,8 @@ IOStatus ZenFS::MigrateFileExtents(
       continue;
     }
 
-    printf("[kqh] Migrate extent: length(%zu) zone(%s)\n", ext->length_,
-           ext->zone_->ToString().c_str());
+    ZnsLog(kGCColor, "[kqh] Migrate extent: length(%zu) zone(%s)",
+           ext->length_, ext->zone_->ToString().c_str());
 
     Zone* target_zone = nullptr;
 
@@ -2062,7 +2075,7 @@ IOStatus ZenFS::MigrateFileExtents(
     if (target_zone == nullptr) {
       zbd_->ReleaseMigrateZone(target_zone);
       Info(logger_, "Migrate Zone Acquire Failed, Ignore Task.");
-      printf("[kqh] Migrate Zone Acquire Failed, Ignore Task.");
+      ZnsLog(kGCColor, "[kqh] Migrate Zone Acquire Failed, Ignore Task.");
       continue;
     }
 
@@ -2082,7 +2095,8 @@ IOStatus ZenFS::MigrateFileExtents(
     // If the file doesn't exist, skip
     if (GetFileNoLock(fname) == nullptr) {
       Info(logger_, "Migrate(%s) file not exist anymore.", fname.c_str());
-      ZnsLog(kRed, "[kqh] Migrate file(%s) not exist anymore.", fname.c_str());
+      ZnsLog(kGCColor, "[kqh] Migrate file(%s) not exist anymore.",
+             fname.c_str());
       zbd_->ReleaseMigrateZone(target_zone);
       break;
     }

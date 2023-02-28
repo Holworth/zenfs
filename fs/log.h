@@ -3,7 +3,7 @@
 #include <cstdarg>
 #include <cstdio>
 
-// #define ZNS_DEBUG_LOG 1
+#define ZNS_DEBUG_LOG 1
 #define ANSI_COLOR_RED "\x1b[31m"
 #define ANSI_COLOR_GREEN "\x1b[32m"
 #define ANSI_COLOR_YELLOW "\x1b[33m"
@@ -11,6 +11,8 @@
 #define ANSI_COLOR_MAGENTA "\x1b[35m"
 #define ANSI_COLOR_CYAN "\x1b[36m"
 #define ANSI_COLOR_RESET "\x1b[0m"
+
+#define ANSI_COLOR_BRIGHT_RED "\x1b[31;1m"
 
 #define ToKiB(num) (num) / (1024.0)
 #define ToMiB(num) (num) / (1024.0 * 1024.0)
@@ -24,8 +26,11 @@ enum Color {
   kBlue,
   kMagenta,
   kCyan,
+  kBrightRed,
   kDisableLog
 };
+
+static const Color kGCColor = kBrightRed;
 
 inline const char* ToString(Color color) {
   switch (color) {
@@ -41,11 +46,18 @@ inline const char* ToString(Color color) {
       return ANSI_COLOR_MAGENTA;
     case kCyan:
       return ANSI_COLOR_CYAN;
+    case kBrightRed:
+      return ANSI_COLOR_BRIGHT_RED;
     default:
       return "";
   }
 }
 
+// A few suggestions on color usage of logger: 
+//  * kRed     : Error message e.g. Zone::Append() fails
+//  * kYellow  : Warning message
+//  * kGreen   : Function returns correctly
+//  * kMagenta : Important status variable. e.g. Open zone count in zbd
 inline void ZnsLog(Color color, const char* fmt, ...) {
 #ifdef ZNS_DEBUG_LOG
   if (color == kDisableLog) {

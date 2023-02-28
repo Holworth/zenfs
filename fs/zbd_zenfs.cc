@@ -153,7 +153,8 @@ IOStatus Zone::Append(char *data, uint32_t size, bool is_gc) {
                                  Env::Default());
   // zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_WRITE_THROUGHPUT, size);
   // if (is_gc) {
-  //   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_GC_WRITE_THROUGHPUT, size);
+  //   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_GC_WRITE_THROUGHPUT,
+  //   size);
   // }
 
   char *ptr = data;
@@ -161,8 +162,11 @@ IOStatus Zone::Append(char *data, uint32_t size, bool is_gc) {
   int fd = zbd_->GetWriteFD();
   int ret;
 
-  if (capacity_ < size)
+  if (capacity_ < size) {
+    ZnsLog(kRed, "No enought capacity: Left(%llu), Write(%llu)", capacity_,
+           size);
     return IOStatus::NoSpace("Not enough capacity for append");
+  }
 
   assert((size % zbd_->GetBlockSize()) == 0);
 
@@ -329,6 +333,11 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   nr_zones_ = info.nr_zones;
   // nr_provisioning_zones_ = (nr_zones_ - ZENFS_META_ZONES) * 0.07;
   nr_provisioning_zones_ = 1;
+
+  // Set the max open and active zone count to be 14, which is a real
+  // hardware parameter. Note that the simulated ZNS SSD does not limit
+  // this parameter
+  info.max_nr_active_zones = info.max_nr_open_zones = 14;
 
   if (info.max_nr_active_zones == 0)
     max_nr_active_io_zones_ = info.nr_zones;
@@ -510,7 +519,7 @@ void ZonedBlockDevice::LogGarbageInfo() {
     assert(garbage_rate >= 0);
     // assert(garbage_rate <= 2);
     if (garbage_rate >= 2) {
-        continue;
+      continue;
     }
     int idx = int((garbage_rate + 0.1) * 10);
     zone_gc_stat[idx]++;
@@ -633,6 +642,9 @@ void ZonedBlockDevice::WaitForOpenIOZoneToken(bool prioritized) {
     allocator_open_limit = max_nr_open_io_zones_ - 1;
   }
 
+  ZnsLog(kMagenta, "WaitForOpenIOZoneToken: %ld, Limit: %ld",
+         open_io_zones_.load(), allocator_open_limit);
+
   /* Wait for an open IO Zone token - after this function returns
    * the caller is allowed to write to a closed zone. The callee
    * is responsible for calling a PutOpenIOZoneToken to return the resource
@@ -662,7 +674,8 @@ bool ZonedBlockDevice::GetActiveIOZoneTokenIfAvailable() {
    * the caller is allowed to write to a closed zone. The callee
    * is responsible for calling a PutActiveIOZoneToken to return the resource
    */
-  printf("[kqh] Get Active Zone Count: %ld\n", active_io_zones_.load());
+  ZnsLog(kMagenta, "GetActiveIOZoneToken: %ld, limit=%ld",
+         active_io_zones_.load(), max_nr_active_io_zones_);
   std::unique_lock<std::mutex> lk(zone_resources_mtx_);
   if (active_io_zones_.load() < max_nr_active_io_zones_) {
     active_io_zones_++;
@@ -674,6 +687,7 @@ bool ZonedBlockDevice::GetActiveIOZoneTokenIfAvailable() {
 }
 
 void ZonedBlockDevice::PutOpenIOZoneToken() {
+  ZnsLog(kMagenta, "PutOpenIOZoneToken: %ld", open_io_zones_.load());
   {
     std::unique_lock<std::mutex> lk(zone_resources_mtx_);
     open_io_zones_--;
@@ -683,7 +697,7 @@ void ZonedBlockDevice::PutOpenIOZoneToken() {
 }
 
 void ZonedBlockDevice::PutActiveIOZoneToken() {
-  printf("[kqh] Put Active Zone Count: %ld\n", active_io_zones_.load());
+  ZnsLog(kMagenta, "PutActiveIOZoneToken: %ld", active_io_zones_.load());
   {
     std::unique_lock<std::mutex> lk(zone_resources_mtx_);
     active_io_zones_--;
@@ -790,7 +804,7 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
   Zone *allocated_zone = nullptr;
   IOStatus s;
 
-  printf("[kqh]: Allocate Zone for BestMatch, hint: %s\n",
+  ZnsLog(kGreen, "[kqh]: Allocate Zone for BestMatch, hint: %s",
          WriteHintToString(file_lifetime).c_str());
 
   for (const auto z : io_zones) {
@@ -835,7 +849,7 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
 
   *best_diff_out = best_diff;
   *zone_out = allocated_zone;
-  printf("[kqh] Returned Allocated Zone: %d best diff=%d (%s)\n",
+  ZnsLog(kGreen, "[kqh] Returned Allocated Zone: %d best diff=%d (%s)",
          allocated_zone ? allocated_zone->ZoneId() : -1, best_diff,
          allocated_zone ? allocated_zone->ToString().c_str() : "");
 
@@ -931,9 +945,9 @@ IOStatus ZonedBlockDevice::TakeMigrateZone(Zone **out_zone,
 
 IOStatus ZonedBlockDevice::AllocateWALZone(Zone **out_zone,
                                            WALZoneAllocationHint *hint) {
-  ZnsLog(kRed, "[kqh] AllocateWALZone(active=%d)", active_wal_zone_);
-  ZnsLog(kRed, "[kqh] AllocateWALZone: zone[0]=%s\nzone[1]=%s",
-         wal_zones_[0]->ToString().c_str(), wal_zones_[1]->ToString().c_str());
+  ZnsLog(kRed, "[kqh] AllocateWALZone(active=%d): zone[0]=%s\nzone[1]=%s",
+         active_wal_zone_, wal_zones_[0]->ToString().c_str(),
+         wal_zones_[1]->ToString().c_str());
 
   ResetUnusedWALZones();
   if (active_wal_zone_ == kNoActiveWALZone) {
@@ -950,10 +964,11 @@ IOStatus ZonedBlockDevice::AllocateWALZone(Zone **out_zone,
     }
   }
 
-  // (kqh): How do we deal with open zone token?
-  // (xzw): An ActiveToken should be taken at the
-  //        first allocation
+  // (xzw): An ActiveToken should be taken at the first allocation
   WaitForOpenIOZoneToken(true);
+  wal_zone_open_count_++;
+  ZnsLog(kMagenta, "WALOpenZoneCount(%d) WALActiveZoneCount(%d)",
+         wal_zone_open_count_.load(), wal_zone_active_count_.load());
 
   // Directly return if the active zone has enough space
   auto ret = wal_zones_[active_wal_zone_];
@@ -964,6 +979,9 @@ IOStatus ZonedBlockDevice::AllocateWALZone(Zone **out_zone,
     if ((*out_zone)->IsEmpty()) {
       auto get_token = GetActiveIOZoneTokenIfAvailable();
       assert(get_token);
+      wal_zone_active_count_++;
+      ZnsLog(kMagenta, "WALOpenZoneCount(%d) WALActiveZoneCount(%d)",
+             wal_zone_open_count_.load(), wal_zone_active_count_.load());
     }
     return IOStatus::OK();
   }
@@ -972,6 +990,9 @@ IOStatus ZonedBlockDevice::AllocateWALZone(Zone **out_zone,
   auto s = SwitchWALZone();
   if (!s.ok()) {
     PutOpenIOZoneToken();
+    wal_zone_open_count_--;
+    ZnsLog(kMagenta, "WALOpenZoneCount(%d) WALActiveZoneCount(%d)",
+           wal_zone_open_count_.load(), wal_zone_active_count_.load());
     return s;
   }
   *out_zone = wal_zones_[active_wal_zone_];
@@ -981,6 +1002,7 @@ IOStatus ZonedBlockDevice::AllocateWALZone(Zone **out_zone,
 }
 
 IOStatus ZonedBlockDevice::SwitchWALZone() {
+  ZnsLog(kMagenta, "SwitchWALZone");
   auto next_wal_zone = wal_zones_[GetAdvancedActiveWALZoneIndex()];
   assert(next_wal_zone->IsEmpty() && !next_wal_zone->IsBusy());
 
@@ -988,6 +1010,9 @@ IOStatus ZonedBlockDevice::SwitchWALZone() {
   if (!get_token) {
     return IOStatus::NoSpace("WALAllocation Get Active Zone Token failed");
   }
+  wal_zone_active_count_++;
+  ZnsLog(kMagenta, "WALOpenZoneCount(%d) WALActiveZoneCount(%d)",
+         wal_zone_open_count_.load(), wal_zone_active_count_.load());
   // (kqh): May need to know all valid file extents in this zone
   active_wal_zone_ = GetAdvancedActiveWALZoneIndex();
   return IOStatus::OK();
@@ -1002,13 +1027,19 @@ IOStatus ZonedBlockDevice::ResetUnusedWALZones() {
     auto z = wal_zones_[i];
     if (wal_zones_[i]->Acquire()) {
       if (!z->IsEmpty() && !z->IsUsed()) {
-        ZnsLog(kBlue, "[kqh] ResetUnusedWALZones: reset zone(%s)\n",
+        ZnsLog(kBlue, "[kqh] ResetUnusedWALZones: reset zone(%s)",
                z->ToString().c_str());
         bool full = z->IsFull();
         IOStatus reset_status = z->Reset();
         IOStatus release_status = z->CheckRelease();
         if (!release_status.ok()) return release_status;
-        if (!full) PutActiveIOZoneToken();
+        if (!full) {
+          // Why put active IO Token only when not full?
+          PutActiveIOZoneToken();
+          wal_zone_active_count_--;
+          ZnsLog(kMagenta, "WALOpenZoneCount(%d) WALActiveZoneCount(%d)",
+                 wal_zone_open_count_.load(), wal_zone_active_count_.load());
+        }
       } else {
         IOStatus release_status = z->CheckRelease();
         if (!release_status.ok()) return release_status;
@@ -1116,7 +1147,7 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
 
     /* If we haven't found an open zone to fill, open a new zone */
     if (allocated_zone == nullptr) {
-      printf("[kqh] Try Allocating from an Empty Zone\n");
+      ZnsLog(kGreen, "[kqh] Try Allocating from an Empty Zone");
       /* We have to make sure we can open an empty zone */
       while (!got_token && !GetActiveIOZoneTokenIfAvailable()) {
         s = FinishCheapestIOZone();
@@ -1190,53 +1221,72 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
 IOStatus ZonedBlockDevice::AllocateKeySSTZone(Zone **out_zone,
                                               KeySSTZoneAllocationHint *hint) {
   assert(hint->level_ >= 0);
-  ZnsLog(kGreen, "[kqh] AllocateKeySSTZone (size=%u level=%d)", hint->size_,
-         hint->level_);
+  ZnsLog(kGreen, "[kqh] AllocateKeySSTZone (file=%s size=%u level=%d)",
+         hint->filename_.c_str(), hint->size_, hint->level_);
 
   // Not aggregated levels
   if (!IsAggregatedLevel(hint->level_)) {
+    // For disaggregated levels, acquire the open token and active token when
+    // the first write happens.
+    if (!is_disaggr_zone_written_) {
+      WaitForOpenIOZoneToken(false);
+      while (!GetActiveIOZoneTokenIfAvailable())
+        ;
+      is_disaggr_zone_written_ = true;
+    }
+
+    ZnsLogKeySSTZoneToken();
+
     *out_zone = key_sst_zones_.back();
     (*out_zone)->LoopForAcquire();
-    ZnsLog(kGreen, "AllocateKeySSTZone: return Zone%d", (*out_zone)->ZoneId());
+    ZnsLog(kGreen, "AllocateKeySSTZone (file=%s): return Zone%d",
+           hint->filename_.c_str(), (*out_zone)->ZoneId());
     return IOStatus::OK();
   }
 
-  // For aggregated levels:
+  // Aggregated Level Zone allocation
   Zone *ret_zone = nullptr;
   while (true) {
     auto old_active_aggr_keysst_zone = active_aggr_keysst_zone_;
     ret_zone = key_sst_zones_[old_active_aggr_keysst_zone];
     ret_zone->LoopForAcquire();
 
+    ZnsLog(kGreen,
+           "AllocateKeySSTZone (file=%s) Zone %d LoopForAcquire Finished",
+           hint->filename_.c_str(), ret_zone->ZoneId());
+
     // After acquiring the ownership of this zone, another might have
     // already changed the active key sst zone, thus a double check is
-    // needed to detect such case
+    // needed to detect such a case
     if (old_active_aggr_keysst_zone != active_aggr_keysst_zone_) {
       ret_zone->CheckRelease();
       continue;
     }
 
-    // if (ret_zone->GetCapacityLeft() >= hint->size_) {
-    if (ret_zone->GetCapacityLeft() >= (4UL * (1UL << 20))) {
-      ZnsLog(kDefault, "[xzw] Zone %d: capacity: %lu, allocation size: %lu",
-             ret_zone->ZoneId(), ret_zone->GetCapacityLeft(), hint->size_);
+    if (ret_zone->GetCapacityLeft() >= hint->size_) {
+      ZnsLog(kGreen,
+             "AllocateKeySSTZone (file=%s) Zone %d: capacity: %lu, allocation "
+             "size: %lu",
+             hint->filename_.c_str(), ret_zone->ZoneId(),
+             ret_zone->GetCapacityLeft(), hint->size_);
       break;
     }
 
-    // TODO: Do file migration on current active key sst zone, but why?
+    // It is impossible that two threads do the same migration task here
     auto s = MigrateAggregatedLevelZone();
     if (!s.ok()) {
       return s;
     }
   }
   *out_zone = ret_zone;
-
-  ZnsLog(kGreen, "AllocateKeySSTZone: Return Zone%d", (*out_zone)->ZoneId());
+  ZnsLog(kGreen, "AllocateKeySSTZone (file=%s): Return Zone%d",
+         hint->filename_.c_str(), (*out_zone)->ZoneId());
   return IOStatus::OK();
 }
 
 IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
   assert(zenfs_ != nullptr);
+
   auto src_zone = key_sst_zones_[active_aggr_keysst_zone_];
 
   if (src_zone->IsEmpty()) {
@@ -1251,23 +1301,77 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
 
   ZnsLog(Color::kBlue, "[xzw] Migrating from zone %d to zone %d",
          src_zone->ZoneId(), dst_zone->ZoneId());
+
+  assert(dst_zone->IsEmpty());
+
+  //
+  // Acquire active and open token for the destination zone of this migration
+  // task. Once the migration is done, put the active and open token of src
+  // zone back. The destination zone takes the active/open token and will
+  // absort incoming key sst writes
+  //
+  WaitForOpenIOZoneToken(false);
+  while (!GetActiveIOZoneTokenIfAvailable())
+    ;
+  keysst_aggr_zone_open_count_ += 1;
+  keysst_aggr_zone_active_count_ += 1;
+
+  ZnsLogKeySSTZoneToken();
+
   auto s = zenfs_->MigrateAggregatedLevelZone(src_zone, dst_zone);
+  if (!s.ok()) {
+    PutOpenIOZoneToken();
+    keysst_aggr_zone_open_count_--;
+
+    PutActiveIOZoneToken();
+    keysst_aggr_zone_active_count_--;
+    src_zone->CheckRelease();
+    ZnsLog(kRed, "MigrateAggregatedLevelZone Fails. [Error: %s]",
+           s.ToString().c_str());
+
+    ZnsLogKeySSTZoneToken();
+    return s;
+  }
+
+  // Change current active zone must be done when src_zone is locked.
+
+  active_aggr_keysst_zone_ = (active_aggr_keysst_zone_ + 1) % 2;
+  ZnsLog(Color::kRed, "Updating active_aggr_keysst_zone_ to %d in superblock",
+         active_aggr_keysst_zone_);
+
+  //
+  // Reset the source zone immediately (if possible) if migration is finished.
+  // The reset operation, migration and change of activated zone pointer should
+  // be combined as an atomic operation so that the concurrent writer should
+  // detect the activated zone has been changed.
+  //
+  if (!src_zone->IsEmpty() && !src_zone->IsUsed()) {
+    ZnsLog(kBlue, "[kqh] ResetUnusedKeySSTZones: reset zone(%s)\n",
+           src_zone->ToString().c_str());
+    bool full = src_zone->IsFull();
+    IOStatus reset_status = src_zone->Reset();
+    if (!reset_status.ok()) {
+      src_zone->CheckRelease();
+      return reset_status;
+    }
+    PutOpenIOZoneToken();
+    keysst_aggr_zone_open_count_--;
+    if (!full) {
+      PutActiveIOZoneToken();
+      keysst_aggr_zone_active_count_--;
+    }
+
+    ZnsLogKeySSTZoneToken();
+  }
+
   src_zone->CheckRelease();
   ZnsLog(Color::kBlue, "[xzw] Migration finished", src_zone->ZoneId(),
          dst_zone->ZoneId());
 
-  if (!s.ok()) {
-    return s;
-  }
-  active_aggr_keysst_zone_ = (active_aggr_keysst_zone_ + 1) % 2;
-
-  ZnsLog(Color::kRed, "Updating active_aggr_keysst_zone_ to %d in superblock",
-         active_aggr_keysst_zone_);
-  s = ResetUnusedKeySSTZones();
-  if (!s.ok()) {
-    return s;
-  }
-
+  // s = ResetUnusedKeySSTZones();
+  // if (!s.ok()) {
+  //   return s;
+  // }
   return IOStatus::OK();
 }
 
@@ -1321,6 +1425,13 @@ void ZonedBlockDevice::SetZoneDeferredStatus(IOStatus status) {
 
 void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
   for (auto *zone : io_zones) {
+    // [kqh]: Ignore special zone since a GC job might operate on zones
+    // reported from this function. However, the reclaimation of WALZone and
+    // KeySSTZone are handled internally by ZenFS instead of DB. We ignore
+    // these special zones to avoid DB reclaimed them.
+    if (IsSpecialZone(zone)) {
+      continue;
+    }
     snapshot.emplace_back(*zone);
   }
 }

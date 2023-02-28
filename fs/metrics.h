@@ -31,6 +31,7 @@
 //    `NoZenFSMetrics`)
 
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <fstream>
@@ -328,6 +329,12 @@ struct XZenFSMetrics {
       uint64_t end_index) {
     std::ofstream of;
     of.open(filename);
+
+    // Calculate the total size
+    uint64_t total = 0;
+    std::for_each(data.begin(), data.end(),
+                  [&](const auto& d) { total += d.load(); });
+    of << total << "\n";
     for (int i = 0; i < std::min(end_index, data.size()); ++i) {
       of << data[i] << "\n";
     }

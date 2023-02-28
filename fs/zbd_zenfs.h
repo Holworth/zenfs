@@ -35,7 +35,7 @@
 namespace ROCKSDB_NAMESPACE {
 
 namespace config {
-  const static int kAggrLevelThreshold = 3;
+const static int kAggrLevelThreshold = 4;
 };
 
 inline std::string IOTypeToString(IOType type) {
@@ -93,10 +93,11 @@ struct ValueSSTZoneAllocationHint : public ZoneAllocationHint {};
 struct KeySSTZoneAllocationHint : public ZoneAllocationHint {
  public:
   KeySSTZoneAllocationHint() = default;
-  KeySSTZoneAllocationHint(size_t size, int level)
-      : size_(size), level_(level) {}
+  KeySSTZoneAllocationHint(size_t size, int level, const std::string &filename)
+      : size_(size), level_(level), filename_(filename) {}
   size_t size_;
   int level_;
+  std::string filename_;
 };
 
 class Zone {
@@ -191,7 +192,7 @@ class ValueSSTZones {};
 class ZonedBlockDevice {
  private:
   // (xzw:TODO) considering referecing the ZenFS within zbd_
-  ZenFS* zenfs_ = nullptr;
+  ZenFS *zenfs_ = nullptr;
 
   std::string filename_;
   uint32_t block_sz_;
@@ -264,8 +265,24 @@ class ZonedBlockDevice {
   IOStatus AllocateMetaZone(Zone **out_meta_zone);
 
   IOStatus AllocateWALZone(Zone **out_zone, WALZoneAllocationHint *hint);
+
   // [kqh] Switch current active WAL Zone
   IOStatus SwitchWALZone();
+
+  // Some monitoring information
+  std::atomic<int> wal_zone_open_count_;
+  std::atomic<int> wal_zone_active_count_;
+
+  std::atomic<int> keysst_aggr_zone_open_count_;
+  std::atomic<int> keysst_aggr_zone_active_count_;
+
+  // Alnert: This field might need persistence and should be initialized from
+  // ZenFS log.
+  std::atomic<bool> is_disaggr_zone_written_;
+
+  std::atomic<int> keysst_disaggr_zone_open_count_;
+  std::atomic<int> keysst_disaggr_zone_active_count_;
+
   // [kqh] If one WAL zone is not used, reset it
   IOStatus ResetUnusedWALZones();
 
@@ -280,7 +297,7 @@ class ZonedBlockDevice {
 
   IOStatus AllocateValueSSTZone(Zone **out_zone,
                                 ValueSSTZoneAllocationHint *hint);
-  
+
   IOStatus ResetUnusedKeySSTZones();
 
   int GetAdvancedActiveWALZoneIndex() {
@@ -351,6 +368,9 @@ class ZonedBlockDevice {
     // Always use the first two zones for WAL allocation
     wal_zones_.push_back(io_zones[0]);
     wal_zones_.push_back(io_zones[1]);
+
+    wal_zone_active_count_.store(0);
+    wal_zone_open_count_.store(0);
   }
 
   void GetZonesForKeySSTAllocation() {
@@ -365,20 +385,34 @@ class ZonedBlockDevice {
     // (xzw): should restore the correct active zone
     // (kqh): Continue writing the zone that has been written already
     active_aggr_keysst_zone_ = io_zones[2]->IsEmpty() ? 1 : 0;
+
+    // Pre-allocate one open and active token for key sst zone
+    auto token = GetActiveIOZoneTokenIfAvailable();
+    assert(token);
+    WaitForOpenIOZoneToken(false);
+
+    keysst_aggr_zone_open_count_.store(1);
+    keysst_aggr_zone_active_count_.store(1);
+
+    keysst_disaggr_zone_open_count_.store(0);
+    keysst_disaggr_zone_active_count_.store(0);
+
+    is_disaggr_zone_written_.store(false);
+
+    ZnsLogKeySSTZoneToken();
+  }
+
+  void ZnsLogKeySSTZoneToken() {
+    ZnsLog(kMagenta,
+           "KeySSTAggrZoneOpenCount(%d) KeySSTAggrZoneActiveCount(%d) "
+           "KeySSTDisAggrZoneOpenCount(%d) KeySSTDisAggrZoneActiveCount(%d)",
+           keysst_aggr_zone_open_count_.load(),
+           keysst_aggr_zone_active_count_.load(),
+           keysst_disaggr_zone_open_count_.load(),
+           keysst_disaggr_zone_active_count_.load());
   }
 
   IOStatus MigrateAggregatedLevelZone();
-
-  bool IsSpecialZone(const Zone *zone) {
-    bool is_wal_zone = zone->ZoneId() == 3 || zone->ZoneId() == 4;
-    bool is_keysst_zone =
-        zone->ZoneId() == 5 || zone->ZoneId() == 6 || zone->ZoneId() == 7;
-    return is_wal_zone || is_keysst_zone;
-  }
-
-  bool IsAggregatedLevel(int level) {
-    return level >= 0 && level <= config::kAggrLevelThreshold;
-  }
 
  public:
   std::string ErrorToString(int err);
@@ -392,8 +426,19 @@ class ZonedBlockDevice {
                                 uint32_t min_capacity = 0);
   IOStatus AllocateEmptyZone(Zone **zone_out);
 
-  void SetZenFS(ZenFS* fs) { zenfs_ = fs; }
-  ZenFS* GetZenFS() const { return zenfs_; }
+  bool IsSpecialZone(const Zone *zone) {
+    bool is_wal_zone = zone->ZoneId() == 3 || zone->ZoneId() == 4;
+    bool is_keysst_zone =
+        zone->ZoneId() == 5 || zone->ZoneId() == 6 || zone->ZoneId() == 7;
+    return is_wal_zone || is_keysst_zone;
+  }
+
+  static bool IsAggregatedLevel(int level) {
+    return level >= 0 && level <= config::kAggrLevelThreshold;
+  }
+
+  void SetZenFS(ZenFS *fs) { zenfs_ = fs; }
+  ZenFS *GetZenFS() const { return zenfs_; }
 };
 
 }  // namespace ROCKSDB_NAMESPACE
