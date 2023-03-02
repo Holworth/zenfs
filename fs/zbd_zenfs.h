@@ -320,6 +320,9 @@ class ZonedBlockDevice {
   uint64_t GetFreeSpace();
   uint64_t GetUsedSpace();
   uint64_t GetReclaimableSpace();
+  // (kqh): OccupySpace means the space that has been written, i.e. The space
+  // between start space and write pointer of each zone
+  uint64_t GetOccupySpace();
 
   std::string GetFilename();
   uint32_t GetBlockSize();

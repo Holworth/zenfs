@@ -33,6 +33,7 @@ class ZBDSnapshot {
   uint64_t free_space;
   uint64_t used_space;
   uint64_t reclaimable_space;
+  uint64_t occupy_space;
 
  public:
   ZBDSnapshot() = default;
@@ -40,7 +41,8 @@ class ZBDSnapshot {
   ZBDSnapshot(ZonedBlockDevice& zbd)
       : free_space(zbd.GetFreeSpace()),
         used_space(zbd.GetUsedSpace()),
-        reclaimable_space(zbd.GetReclaimableSpace()) {}
+        reclaimable_space(zbd.GetReclaimableSpace()),
+        occupy_space(zbd.GetOccupySpace()) {}
 };
 
 class ZoneSnapshot {

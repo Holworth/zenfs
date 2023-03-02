@@ -11,6 +11,7 @@
 
 #include "fs/io_zenfs.h"
 #include "fs/log.h"
+#include "fs/metrics.h"
 #include "fs/zbd_zenfs.h"
 #include "rocksdb/io_status.h"
 #include "util/mutexlock.h"
@@ -1661,7 +1662,11 @@ Status ListZenFileSystems(std::map<std::string, std::string>& out_list) {
 void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
                              const ZenFSSnapshotOptions& options) {
   if (options.zbd_) {
-    snapshot.zbd_ = ZBDSnapshot(*zbd_);
+    auto zbd_info = ZBDSnapshot(*zbd_);
+    snapshot.zbd_ = zbd_info;
+    zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.used_space, kUsedSpace);
+    zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.free_space, kFreeSpace);
+    zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.occupy_space,kOccupySpace);
   }
   if (options.zone_) {
     zbd_->GetZoneSnapshot(snapshot.zones_);

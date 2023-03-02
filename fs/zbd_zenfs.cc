@@ -454,6 +454,14 @@ uint64_t ZonedBlockDevice::GetReclaimableSpace() {
   return reclaimable;
 }
 
+uint64_t ZonedBlockDevice::GetOccupySpace() {
+  uint64_t occupy = 0;
+  for (const auto z : io_zones) {
+    occupy += (z->wp_ - z->start_);
+  }
+  return occupy;
+}
+
 void ZonedBlockDevice::LogZoneStats() {
   uint64_t used_capacity = 0;
   uint64_t reclaimable_capacity = 0;

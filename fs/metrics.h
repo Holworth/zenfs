@@ -208,6 +208,10 @@ enum XZenFSMetricsType {
   kValueSST,
   kGCMigrate,
   kGCWrite,
+
+  kOccupySpace,
+  kUsedSpace,
+  kFreeSpace,
 };
 
 // A thread-safe metrics
@@ -215,6 +219,7 @@ struct XZenFSMetrics {
   static const uint64_t kRecordIntervalMs = 1000;
   static const uint64_t kMaxHistCount = 10000;
 
+  // Related monitor histogram of ZNS write behaviour
   std::array<std::atomic<uint64_t>, kMaxHistCount> wal_write_bytes_hist;
   std::array<std::atomic<uint64_t>, kMaxHistCount> value_sst_write_bytes_hist;
   std::array<std::atomic<uint64_t>, kMaxHistCount> key_sst_write_bytes_hist;
@@ -223,24 +228,15 @@ struct XZenFSMetrics {
   std::array<std::atomic<uint64_t>, kMaxHistCount> gc_new_sst_write_bytes_hist;
   std::array<std::atomic<uint64_t>, kMaxHistCount> zns_write_bytes_hist;
 
-  std::atomic<uint64_t> wal_write_bytes_total;
-  std::atomic<uint64_t> value_sst_write_bytes_total;
-  std::atomic<uint64_t> key_sst_write_bytes_total;
-  std::atomic<uint64_t> gc_migrate_sst_write_bytes_total;
-  std::atomic<uint64_t> gc_new_sst_write_bytes_total;
-  std::atomic<uint64_t> zns_write_bytes_total;
+  // Related monitors of ZNS space usage
+  std::array<std::atomic<uint64_t>, kMaxHistCount> zns_occupy_space_hist;
+  std::array<std::atomic<uint64_t>, kMaxHistCount> zns_used_space_hist;
+  std::array<std::atomic<uint64_t>, kMaxHistCount> zns_free_space_hist;
 
   decltype(std::chrono::steady_clock::now()) start_time_point;
 
  public:
-  XZenFSMetrics()
-      : wal_write_bytes_total(0),
-        value_sst_write_bytes_total(0),
-        key_sst_write_bytes_total(0),
-        gc_migrate_sst_write_bytes_total(0),
-        gc_new_sst_write_bytes_total(0),
-        zns_write_bytes_total(0),
-        start_time_point(std::chrono::steady_clock::now()) {
+  XZenFSMetrics() : start_time_point(std::chrono::steady_clock::now()) {
     for (uint64_t i = 0; i < kMaxHistCount; ++i) {
       wal_write_bytes_hist[i].store(0);
       key_sst_write_bytes_hist[i].store(0);
@@ -248,6 +244,10 @@ struct XZenFSMetrics {
       gc_migrate_sst_write_bytes_hist[i].store(0);
       gc_new_sst_write_bytes_hist[i].store(0);
       zns_write_bytes_hist[i].store(0);
+
+      zns_occupy_space_hist[i].store(0);
+      zns_used_space_hist[i].store(0);
+      zns_free_space_hist[i].store(0);
     }
   }
 
@@ -260,27 +260,39 @@ struct XZenFSMetrics {
     switch (type) {
       case kWAL:
         wal_write_bytes_hist[index] += size;
-        wal_write_bytes_total += size;
         break;
       case kKeySST:
         key_sst_write_bytes_hist[index] += size;
-        key_sst_write_bytes_total += size;
         break;
       case kValueSST:
         value_sst_write_bytes_hist[index] += size;
-        value_sst_write_bytes_total += size;
         break;
       case kGCMigrate:
         gc_migrate_sst_write_bytes_hist[index] += size;
-        gc_migrate_sst_write_bytes_total += size;
         break;
       case kGCWrite:
         gc_new_sst_write_bytes_hist[index] += size;
-        gc_new_sst_write_bytes_total += size;
         break;
       case kTotal:
         zns_write_bytes_hist[index] += size;
-        zns_write_bytes_total += size;
+        break;
+      default:
+        assert(false);
+    }
+  }
+
+  void RecordZNSSpace(uint64_t size, XZenFSMetricsType type) {
+    auto elapse_time = ElapseTime();
+    auto index = elapse_time / kRecordIntervalMs;
+    switch (type) {
+      case kFreeSpace:
+        zns_free_space_hist[index].store(size);
+        break;
+      case kOccupySpace:
+        zns_occupy_space_hist[index].store(size);
+        break;
+      case kUsedSpace:
+        zns_used_space_hist[index].store(size);
         break;
       default:
         assert(false);
@@ -296,19 +308,17 @@ struct XZenFSMetrics {
 
   std::string SummarizeAsString() const {
     std::stringstream ss;
-    ss << "[Key SST Write Bytes : " << ToMiB(key_sst_write_bytes_total)
-       << "MiB]"
-       << "[Value SST Write Bytes :" << ToMiB(value_sst_write_bytes_total)
-       << "MiB]"
-       << "[GC Migrate Write Bytes :" << ToMiB(gc_migrate_sst_write_bytes_total)
-       << "MiB]"
-       << "[ZNS Write Bytes : " << ToMiB(zns_write_bytes_total) << "MiB]";
+    ss << "[Key SST Write Bytes : " << ToMiB(0) << "MiB]"
+       << "[Value SST Write Bytes :" << ToMiB(0) << "MiB]"
+       << "[GC Migrate Write Bytes :" << ToMiB(0) << "MiB]"
+       << "[ZNS Write Bytes : " << ToMiB(0) << "MiB]";
     return ss.str();
   }
 
   void Dump(const std::string& filename_prefix) {
     auto end_index = ElapseTime() / kRecordIntervalMs;
 
+    // Dump write throughput
     DumpSingleHist(filename_prefix + "wal_write_bytes_hist",
                    wal_write_bytes_hist, end_index);
     DumpSingleHist(filename_prefix + "value_sst_write_bytes_hist",
@@ -321,20 +331,30 @@ struct XZenFSMetrics {
                    gc_new_sst_write_bytes_hist, end_index);
     DumpSingleHist(filename_prefix + "zns_write_bytes_hist",
                    zns_write_bytes_hist, end_index);
+
+    // Dump space usage
+    DumpSingleHist(filename_prefix + "zns_free_space_hist", zns_free_space_hist,
+                   end_index);
+    DumpSingleHist(filename_prefix + "zns_occupy_space_hist",
+                   zns_occupy_space_hist, end_index);
+    DumpSingleHist(filename_prefix + "zns_used_space_hist", zns_used_space_hist,
+                   end_index);
   }
 
   void DumpSingleHist(
       const std::string& filename,
       const std::array<std::atomic<uint64_t>, kMaxHistCount>& data,
-      uint64_t end_index) {
+      uint64_t end_index, bool sum_up = true) {
     std::ofstream of;
     of.open(filename);
 
     // Calculate the total size
-    uint64_t total = 0;
-    std::for_each(data.begin(), data.end(),
-                  [&](const auto& d) { total += d.load(); });
-    of << total << "\n";
+    if (sum_up) {
+      uint64_t total = 0;
+      std::for_each(data.begin(), data.end(),
+                    [&](const auto& d) { total += d.load(); });
+      of << total << "\n";
+    }
     for (int i = 0; i < std::min(end_index, data.size()); ++i) {
       of << data[i] << "\n";
     }
