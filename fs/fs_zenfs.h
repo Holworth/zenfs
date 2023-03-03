@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+#include "db/compaction_iteration_stats.h"
+#include "fs/log.h"
 #include "rocksdb/io_status.h"
 #if __cplusplus >= 201703L
 #include <filesystem>
@@ -210,9 +212,7 @@ class ZenFS : public FileSystemWrapper {
     return zbd_->GetXMetrics();
   }
 
-  void Dump() override {
-    zbd_->GetXMetrics()->Dump("");
-  }
+  void Dump() override { zbd_->GetXMetrics()->Dump(""); }
 
   std::string ToAuxPath(std::string path) {
     return superblock_->GetAuxFsPath() + path;
@@ -475,6 +475,11 @@ class ZenFS : public FileSystemWrapper {
   IOStatus MigrateFileExtentsWithFSLock(
       const std::string& fname,
       const std::vector<ZoneExtentSnapshot*>& migrate_exts, Zone* dest_zone);
+
+  void UpdateCompactionIterStats(
+      const CompactionIterationStats* iter_stat) override {
+    ZnsLog(kCyan, "[ZenFS:UpdateCompactionIterStats]");
+  }
 
  public:
   using FileToExtents =
