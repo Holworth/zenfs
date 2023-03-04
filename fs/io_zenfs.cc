@@ -271,7 +271,7 @@ Status ZoneFile::MergeUpdate(std::shared_ptr<ZoneFile> update, bool replace) {
 
 ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id)
     : zbd_(zbd),
-      active_zone_(NULL),
+      active_zone_(nullptr),
       extent_start_(NO_EXTENT),
       extent_filepos_(0),
       lifetime_(Env::WLTH_NOT_SET),
@@ -279,6 +279,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id)
       file_size_(0),
       file_id_(file_id),
       level_(uint64_t(-1)),
+      belonged_zone_(nullptr),
       nr_synced_extents_(0),
       m_time_(0) {}
 
@@ -520,6 +521,7 @@ IOStatus ZoneFile::AllocateNewZone() {
     return IOStatus::NoSpace("Zone allocation failure");
   }
   SetActiveZone(zone);
+  SetBelongedZone(zone);
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = file_size_;
 
@@ -573,6 +575,7 @@ IOStatus ZoneFile::AllocateNewZoneForWrite(size_t size) {
   }
 
   SetActiveZone(zone);
+  SetBelongedZone(zone);
   extent_start_ = active_zone_->wp_;
   extent_filepos_ = file_size_;
 
@@ -1030,6 +1033,12 @@ void ZoneFile::SetActiveZone(Zone* zone) {
   assert(zone->IsBusy());
   active_zone_ = zone;
 }
+
+void ZoneFile::SetBelongedZone(Zone* zone) {
+  assert(zone->IsBusy());
+  belonged_zone_ = zone;
+}
+
 
 ZenFSMetricsHistograms ZoneFile::GetReportType() const {
   ZenFSMetricsHistograms type;

@@ -203,7 +203,7 @@ inline IOStatus Zone::CheckRelease() {
   return IOStatus::OK();
 }
 
-int Zone::ZoneId() const {
+zone_id_t Zone::ZoneId() const {
   auto zone_size = zbd_->GetZoneSize();
   if (zone_size == 0) {
     return -1;
@@ -214,7 +214,7 @@ int Zone::ZoneId() const {
 std::string Zone::ToString() const {
   char buf[256];
   sprintf(buf,
-          "ZoneId(%d) start_=%zu wp=%zu free capacity_=%zu used_=%zu hint=%s "
+          "ZoneId(%lu) start_=%zu wp=%zu free capacity_=%zu used_=%zu hint=%s "
           "prov=%d",
           ZoneId(), start_, wp_, capacity_, used_capacity_.load(),
           WriteHintToString(this->lifetime_).c_str(), provisioning_zone_);
@@ -423,6 +423,8 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
 
   GetZonesForWALAllocation();
   GetZonesForKeySSTAllocation();
+
+  InitializeZoneGCStats();
 
   free(zone_rep);
   start_time_ = time(NULL);

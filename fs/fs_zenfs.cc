@@ -14,6 +14,7 @@
 #include "fs/metrics.h"
 #include "fs/zbd_zenfs.h"
 #include "rocksdb/io_status.h"
+#include "util/filename.h"
 #include "util/mutexlock.h"
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
@@ -1327,6 +1328,8 @@ Status ZenFS::RecoverFrom(ZenMetaLog* log) {
     return Status::NotFound("ZenFS", "No snapshot found");
 }
 
+void ZenFS::Dump() { zbd_->GetXMetrics()->Dump(""); }
+
 /* Mount the filesystem by recovering form the latest valid metadata zone */
 Status ZenFS::Mount(bool readonly) {
   std::vector<Zone*> metazones = zbd_->GetMetaZones();
@@ -1666,7 +1669,7 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
     snapshot.zbd_ = zbd_info;
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.used_space, kUsedSpace);
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.free_space, kFreeSpace);
-    zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.occupy_space,kOccupySpace);
+    zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.occupy_space, kOccupySpace);
   }
   if (options.zone_) {
     zbd_->GetZoneSnapshot(snapshot.zones_);
@@ -1703,7 +1706,7 @@ IOStatus ZenFS::MigrateExtents(
   for (auto* ext : extents) {
     std::string fname = ext->filename;
     // We only migrate SST file extents
-    if (ends_with(fname, ".sst")) {
+    if (ends_with(fname, kSSTFileNameSuffixWithDot)) {
       file_extents[fname].emplace_back(ext);
     }
   }
@@ -1932,7 +1935,7 @@ IOStatus ZenFS::GetAggrLevelZoneExtents(
     if (file.IsKeySST() &&
         ZonedBlockDevice::IsAggregatedLevel(file.GetLevel())) {
       // extent -> file mapping
-      assert(ends_with(file.GetFilename(), ".sst"));
+      assert(ends_with(file.GetFilename(), kSSTFileNameSuffixWithDot));
       for (auto* ext : file.GetExtents()) {
         (*extents)[file.GetFilename()].emplace_back(
             new ZoneExtentSnapshot(*ext, file.GetFilename()));
@@ -2013,6 +2016,28 @@ IOStatus ZenFS::MigrateFileExtentsWithFSLock(
   return IOStatus::OK();
 }
 
+// Is this function thread-safe?
+void ZenFS::UpdateCompactionIterStats(
+    const CompactionIterationStats* iter_stat) {
+  ZnsLog(
+      kCyan,
+      "[=================== ZenFS:UpdateCompactionIterStats] ==============");
+
+  for (const auto& [edge, count] : iter_stat->deprecated_count) {
+    // XTODO: current this name works, but we need some other method
+    // to generate correct names according to the dbname
+    auto victim_file_name = MakeTableFileName("/testdb", edge.second);
+    auto victim_file = GetFile(victim_file_name);
+
+    // not sure whether this assertion should be removed
+    assert(victim_file != nullptr);
+    auto zone = victim_file->GetBelongedZone();
+
+    auto zone_gc_stats = zbd_->GetZoneGCStatsOf(zone->ZoneId());
+    zone_gc_stats->no_valid_kv -= count;
+  }
+}
+
 // Migrate a given file and associated migration extents
 IOStatus ZenFS::MigrateFileExtents(
     const std::string& fname,
@@ -2058,8 +2083,8 @@ IOStatus ZenFS::MigrateFileExtents(
       continue;
     }
 
-    ZnsLog(kGCColor, "[kqh] Migrate extent: length(%zu) zone(%s)",
-           ext->length_, ext->zone_->ToString().c_str());
+    ZnsLog(kGCColor, "[kqh] Migrate extent: length(%zu) zone(%s)", ext->length_,
+           ext->zone_->ToString().c_str());
 
     Zone* target_zone = nullptr;
 

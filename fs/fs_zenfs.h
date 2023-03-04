@@ -212,7 +212,7 @@ class ZenFS : public FileSystemWrapper {
     return zbd_->GetXMetrics();
   }
 
-  void Dump() override { zbd_->GetXMetrics()->Dump(""); }
+  void Dump() override;
 
   std::string ToAuxPath(std::string path) {
     return superblock_->GetAuxFsPath() + path;
@@ -477,9 +477,7 @@ class ZenFS : public FileSystemWrapper {
       const std::vector<ZoneExtentSnapshot*>& migrate_exts, Zone* dest_zone);
 
   void UpdateCompactionIterStats(
-      const CompactionIterationStats* iter_stat) override {
-    ZnsLog(kCyan, "[ZenFS:UpdateCompactionIterStats]");
-  }
+      const CompactionIterationStats* iter_stat) override;
 
  public:
   using FileToExtents =

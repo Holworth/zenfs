@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <queue>
 #include <unordered_map>
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
@@ -33,6 +34,9 @@
 #include "rocksdb/io_status.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+using zone_id_t = uint64_t;
+static const zone_id_t kInvalidZoneId = -1;
 
 namespace config {
 const static int kAggrLevelThreshold = 4;
@@ -100,6 +104,50 @@ struct KeySSTZoneAllocationHint : public ZoneAllocationHint {
   std::string filename_;
 };
 
+// Describe A Zone's stats in the view of GC
+// We can keep ZoneGCStats in several heaps for quickly finding the zone with
+// the highest GC ratio
+//
+// Dynamically sorting the stats may not be desirable because it takes hundres
+// of microseconds, meanwhile, read/write takes only tens of microseconds
+struct ZoneGCStats {
+  ZoneGCStats(zone_id_t id)
+      : zone_id(id), no_blobs(0), no_kv(1), no_valid_kv(0) {}
+
+  ZoneGCStats() : ZoneGCStats(kInvalidZoneId) {}
+  ~ZoneGCStats() = default;
+
+  // we keep zone GCStats away from Zones, so that we can sort these stats
+  // in various ways as we need
+  zone_id_t zone_id;
+
+  // Make this field atomic for a guarantee of thread-safety
+  std::atomic<uint64_t> no_blobs;
+  std::atomic<uint64_t> no_kv;  // avoid float exception
+  std::atomic<uint64_t> no_valid_kv;
+
+  // calculated as size_of_total_valid_blobs / used_capacity
+  // for experiments, the values are fixed-sized, thus we use
+  // valid kv count and total kv count instead size for GC
+  double gc_ratio = 0.0;
+
+  // used capacity is not recorded, ZenFS can locate such information
+  // by looking for a zone in the ZonedBlockDevice
+
+  // A Clear() interface reset the recorded states of the zone. It is used
+  // when a gc task is finished
+  void Clear() {
+    no_blobs = 0;
+    no_kv = 1;
+    no_valid_kv = 0;
+    gc_ratio = 0.0;
+  }
+
+  double GarbageRatio() const { 
+    return 1 - (double)no_valid_kv / no_kv;
+  }
+};
+
 class Zone {
   ZonedBlockDevice *zbd_;
   std::atomic_bool busy_;
@@ -154,7 +202,7 @@ class Zone {
   inline IOStatus CheckRelease();
 
   // (kqh): return the id of zone for readability
-  int ZoneId() const;
+  zone_id_t ZoneId() const;
   // (kqh): Dump the status of current zone
   std::string ToString() const;
 };
@@ -202,6 +250,9 @@ class ZonedBlockDevice {
   // number of total zones.
   uint32_t nr_provisioning_zones_;
   std::vector<Zone *> io_zones;
+
+  // maps from zone ID to zone GC stats
+  std::unordered_map<zone_id_t, ZoneGCStats> zone_gc_stats_map_;
 
   // [kqh] More specific zone allocation
   std::vector<Zone *> wal_zones_;
@@ -286,13 +337,11 @@ class ZonedBlockDevice {
   // [kqh] If one WAL zone is not used, reset it
   IOStatus ResetUnusedWALZones();
 
-  /*
-   * (xzw:TODO): allocate a key sst from managed KeySSTZones
-   *
-   * During the allocation, if the active low zone is used up,
-   * we should migrate valid files from the used-up zone to the backup
-   * zone and activate the backup zone as the new active low zone
-   */
+  // (xzw:TODO): allocate a key sst from managed KeySSTZones
+
+  // During the allocation, if the active low zone is used up,
+  // we should migrate valid files from the used-up zone to the backup
+  // zone and activate the backup zone as the new active low zone
   IOStatus AllocateKeySSTZone(Zone **out_zone, KeySSTZoneAllocationHint *hint);
 
   IOStatus AllocateValueSSTZone(Zone **out_zone,
@@ -326,6 +375,13 @@ class ZonedBlockDevice {
 
   std::string GetFilename();
   uint32_t GetBlockSize();
+
+  ZoneGCStats *GetZoneGCStatsOf(uint64_t zone_id) {
+    auto it = zone_gc_stats_map_.find(zone_id);
+    assert(zone_id < nr_zones_);
+    assert(it != zone_gc_stats_map_.end());
+    return &it->second;
+  }
 
   IOStatus ResetUnusedIOZones();
   void LogZoneStats();
@@ -367,6 +423,9 @@ class ZonedBlockDevice {
   IOStatus TakeMigrateZone(Zone **out_zone, Env::WriteLifeTimeHint lifetime,
                            uint32_t min_capacity);
 
+  // ===========================================================
+  // =========== Bytedance Project Development ==================
+  // ===========================================================
   void GetZonesForWALAllocation() {
     // Always use the first two zones for WAL allocation
     wal_zones_.push_back(io_zones[0]);
@@ -405,6 +464,19 @@ class ZonedBlockDevice {
     ZnsLogKeySSTZoneToken();
   }
 
+  void InitializeZoneGCStats() {
+    // For simplicity, the gc stats table is initialized to be a bare state on
+    // each Open invoke. This has no relevance to the effect of our GC/placement
+    // strategy if we only run it once.
+    // However, GC stats table needs to be persisted on each update and are
+    // supposed to be intialized from persistent records to achive a full
+    // functionality.
+
+    for (int i = 0; i < nr_zones_; ++i) {
+      zone_gc_stats_map_.emplace(i, i);
+    }
+  }
+
   void ZnsLogKeySSTZoneToken() {
     ZnsLog(kMagenta,
            "KeySSTAggrZoneOpenCount(%d) KeySSTAggrZoneActiveCount(%d) "
@@ -416,6 +488,10 @@ class ZonedBlockDevice {
   }
 
   IOStatus MigrateAggregatedLevelZone();
+
+  // ===========================================================
+  // =========== Bytedance Project Development (END) ==================
+  // ===========================================================
 
  public:
   std::string ErrorToString(int err);

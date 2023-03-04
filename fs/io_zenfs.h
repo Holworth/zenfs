@@ -81,6 +81,13 @@ class ZoneFile {
   uint64_t file_id_;
   uint64_t level_;
 
+  // xzw: Since we do not allow files to span multiple zones
+  // we use this field to track the zone that this file
+  // is stored in.
+  //
+  // Questionable: not sure how the output files are determined
+  Zone* belonged_zone_;
+
   uint32_t nr_synced_extents_ = 0;
   bool open_for_wr_ = false;
   time_t m_time_;
@@ -145,9 +152,7 @@ class ZoneFile {
     return (io_type_ == IOType::kCompactionOutputFile && GetLevel() == -1);
   }
 
-  bool IsWAL() const { 
-    return io_type_ == IOType::kWAL;
-  }
+  bool IsWAL() const { return io_type_ == IOType::kWAL; }
 
   // Record size of one write operation
   void RecordWrite(uint64_t size) const {
@@ -163,6 +168,8 @@ class ZoneFile {
       zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kWAL);
     }
   }
+
+  Zone* GetBelongedZone() { return belonged_zone_; }
 
   // ============================================================================
   //  Modification End
@@ -219,6 +226,7 @@ class ZoneFile {
  private:
   void ReleaseActiveZone();
   void SetActiveZone(Zone* zone);
+  void SetBelongedZone(Zone* zone);
   IOStatus CloseActiveZone();
 
  public:
