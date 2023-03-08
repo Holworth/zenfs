@@ -11,6 +11,7 @@
 #include "db/compaction_iteration_stats.h"
 #include "fs/log.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/table_properties.h"
 #if __cplusplus >= 201703L
 #include <filesystem>
 #define CPP17
@@ -213,6 +214,8 @@ class ZenFS : public FileSystemWrapper {
   }
 
   void Dump() override;
+
+  void DumpZoneGCStats();
 
   std::string ToAuxPath(std::string path) {
     return superblock_->GetAuxFsPath() + path;
@@ -478,6 +481,9 @@ class ZenFS : public FileSystemWrapper {
 
   void UpdateCompactionIterStats(
       const CompactionIterationStats* iter_stat) override;
+
+  void UpdateTableProperties(const std::string& fname,
+                             const TableProperties* tbl_prop) override;
 
  public:
   using FileToExtents =

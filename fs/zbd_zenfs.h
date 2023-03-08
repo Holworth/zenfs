@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <queue>
 #include <unordered_map>
@@ -21,12 +22,16 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "libcuckoo/cuckoohash_map.hh"
 #include "log.h"
 #include "metrics.h"
 #include "rocksdb/env.h"
@@ -37,6 +42,8 @@ namespace ROCKSDB_NAMESPACE {
 
 using zone_id_t = uint64_t;
 static const zone_id_t kInvalidZoneId = -1;
+
+using libcuckoo::cuckoohash_map;
 
 namespace config {
 const static int kAggrLevelThreshold = 4;
@@ -143,9 +150,16 @@ struct ZoneGCStats {
     gc_ratio = 0.0;
   }
 
-  double GarbageRatio() const { 
-    return 1 - (double)no_valid_kv / no_kv;
+  std::string Dump() {
+    char buf[512];
+    sprintf(buf,
+            "[Zone: %lu][NoBlob: %lu][NoKV: %lu][NoValidKV: %lu][GR: %.2lf]",
+            zone_id, no_blobs.load(), no_kv.load(), no_valid_kv.load(),
+            GarbageRatio());
+    return std::string(buf);
   }
+
+  double GarbageRatio() const { return 1 - (double)no_valid_kv / no_kv; }
 };
 
 class Zone {
@@ -199,7 +213,7 @@ class Zone {
 
   void EncodeJson(std::ostream &json_stream);
 
-  inline IOStatus CheckRelease();
+  IOStatus CheckRelease();
 
   // (kqh): return the id of zone for readability
   zone_id_t ZoneId() const;
@@ -238,6 +252,9 @@ class KeySSTZones {
 class ValueSSTZones {};
 
 class ZonedBlockDevice {
+  friend class ZenFS;
+  static constexpr uint64_t kMaxPartitionNum = 32;
+
  private:
   // (xzw:TODO) considering referecing the ZenFS within zbd_
   ZenFS *zenfs_ = nullptr;
@@ -251,8 +268,33 @@ class ZonedBlockDevice {
   uint32_t nr_provisioning_zones_;
   std::vector<Zone *> io_zones;
 
+  // ========================================================================
+  // ZNS Project
+  // ========================================================================
+
+  // ------------------- Garbage Related Management ---------------------- //
+
   // maps from zone ID to zone GC stats
   std::unordered_map<zone_id_t, ZoneGCStats> zone_gc_stats_map_;
+
+  // A strcture that depicts the deprecation relationship between zones. An
+  // edge <<src, dst>, num> means Zone(src) deprecates num records in Zone(dst)
+  // This structure is used to calculate a "good" approximation of garbages
+  // across zones
+  struct ZoneDeprecationGraph {
+    uint64_t zone_num;
+    // Denote this graph
+    std::vector<std::shared_ptr<cuckoohash_map<zone_id_t, uint64_t>>> graphs;
+
+    ZoneDeprecationGraph(uint64_t _zone_num)
+        : zone_num(_zone_num), graphs(_zone_num, nullptr) {}
+
+    void AddEdge(zone_id_t src, zone_id_t dst, uint64_t num);
+    void Clear(zone_id_t src, zone_id_t dst);
+    uint64_t GetEdgeNum(zone_id_t src, zone_id_t dst);
+  };
+
+  // --------------------------------------------------------------------- //
 
   // [kqh] More specific zone allocation
   std::vector<Zone *> wal_zones_;
@@ -260,11 +302,104 @@ class ZonedBlockDevice {
   int active_wal_zone_ = kNoActiveWALZone;
   const static int kNoActiveWALZone = -1;
 
+  // Key SST Zone management related data structures
   std::vector<Zone *> key_sst_zones_;
   int active_aggr_keysst_zone_ = kNoActiveAggrKeySSTZone;
   const static int kNoActiveAggrKeySSTZone = -1;
 
+  // Value SST Zone management related data structures
   std::vector<Zone *> value_sst_zones_;
+
+  // May use an implementation of concurrent queue.
+  std::deque<zone_id_t> empty_zones_;
+  std::mutex empty_zone_mtx_;
+
+ public:
+  // ------------------------- Value SST Management --------------------------
+  //
+  // A ZonePartition is an abstraction and calpulation of zones in a specific
+  // partition: HashPartition/Hot/Warm.
+  //
+  // In normal case, each partition contains only one activated zone absorbing
+  // incoming SST write. When GC occurs, addtitional zones would be added and
+  // used for GC write to avoid intervening foreground write
+  //
+  // This struct only provides basic functionalities. For Hot/Warm partition,
+  // implement a specific class derived from this struct and add specialized
+  // interfaces.
+  //
+  // This struct should be implemented as thread-safe structs
+  struct ZonePartition {
+    std::unordered_set<zone_id_t> zones;
+    zone_id_t activated_zone;
+    ZonedBlockDevice *zbd;
+
+    //
+    // The current zone being written for garbage collected data. We consider
+    // decomposing the activated_zone and gc_write_zone. The formmer is used
+    // for absorbing forground write while the latter is used for aborbing
+    // data of resultant file of a garbage collection scheme. Decomposing
+    // zones of two different usage helps preventing intervening.
+    //
+    // However, designating an extra gc_write_zone requires extra active and
+    // open token. We consider reusing the activated_zone in the presence of
+    // tokens' inadequacy.
+    //
+    zone_id_t curr_gc_write_zone;
+
+    ZonePartition(const std::unordered_set<zone_id_t> &_zones,
+                  ZonedBlockDevice *_zbd)
+        : zones(_zones), activated_zone(kInvalidZoneId), zbd(_zbd) {}
+
+    // Getter and Setter for activate zone
+    zone_id_t GetActivatedZone() const { return activated_zone; }
+    void SetActivateZone(zone_id_t zone) { activated_zone = zone; }
+
+    // Manipulate interface for contained zones in this partition
+    void AddZone(zone_id_t zone) {
+      assert(zones.count(zone) == 0);
+      zones.emplace(zone);
+    }
+
+    void RemoveZone(zone_id_t zone) {
+      assert(zones.count(zone) == 1);
+      zones.erase(zone);
+    }
+
+    // For Debug purpose
+    std::string Dump() {
+      std::stringstream ss;
+      for (const auto &zone_id : zones) {
+        auto zone = zbd->GetZone(zone_id);
+        auto gc_stat = zbd->GetZoneGCStatsOf(zone_id);
+        ss << "[Zone" << zone_id
+           << "][Capacity: " << ToMiB(zone->GetCapacityLeft()) << "MiB]";
+        ss << gc_stat->Dump() << "\n";
+      }
+      return ss.str();
+    }
+  };
+
+  struct HashPartition : public ZonePartition {
+    HashPartition(const std::unordered_set<zone_id_t> &_zones,
+                  ZonedBlockDevice *_zbd)
+        : ZonePartition(_zones, _zbd) {}
+  };
+  struct HotPartition : public ZonePartition {
+    HotPartition(const std::unordered_set<zone_id_t> &_zones,
+                 ZonedBlockDevice *_zbd)
+        : ZonePartition(_zones, _zbd) {}
+  };
+
+  // This field should be initialized from the constructor parameters.
+  uint32_t partition_num = 4;
+  std::shared_ptr<HashPartition> hash_partitions_[kMaxPartitionNum];
+  std::shared_ptr<HotPartition> hot_partition_;
+  std::shared_ptr<HotPartition> warm_partition_;
+
+  // --------------------------------------------------------------------------
+
+  // ========================================================================
 
   std::vector<Zone *> meta_zones;
   // Zones for over-provisioning
@@ -315,11 +450,6 @@ class ZonedBlockDevice {
                           Zone **out_zone);
   IOStatus AllocateMetaZone(Zone **out_meta_zone);
 
-  IOStatus AllocateWALZone(Zone **out_zone, WALZoneAllocationHint *hint);
-
-  // [kqh] Switch current active WAL Zone
-  IOStatus SwitchWALZone();
-
   // Some monitoring information
   std::atomic<int> wal_zone_open_count_;
   std::atomic<int> wal_zone_active_count_;
@@ -337,17 +467,8 @@ class ZonedBlockDevice {
   // [kqh] If one WAL zone is not used, reset it
   IOStatus ResetUnusedWALZones();
 
-  // (xzw:TODO): allocate a key sst from managed KeySSTZones
-
-  // During the allocation, if the active low zone is used up,
-  // we should migrate valid files from the used-up zone to the backup
-  // zone and activate the backup zone as the new active low zone
-  IOStatus AllocateKeySSTZone(Zone **out_zone, KeySSTZoneAllocationHint *hint);
-
   IOStatus AllocateValueSSTZone(Zone **out_zone,
                                 ValueSSTZoneAllocationHint *hint);
-
-  IOStatus ResetUnusedKeySSTZones();
 
   int GetAdvancedActiveWALZoneIndex() {
     return (active_wal_zone_ + 1) % wal_zones_.size();
@@ -426,56 +547,42 @@ class ZonedBlockDevice {
   // ===========================================================
   // =========== Bytedance Project Development ==================
   // ===========================================================
-  void GetZonesForWALAllocation() {
-    // Always use the first two zones for WAL allocation
-    wal_zones_.push_back(io_zones[0]);
-    wal_zones_.push_back(io_zones[1]);
 
-    wal_zone_active_count_.store(0);
-    wal_zone_open_count_.store(0);
-  }
+  // -------- Initialization related functions ---------------//
 
-  void GetZonesForKeySSTAllocation() {
-    // Always use 3 zones preceding wal zones for KeySST allocation
-    // io_zones[2]->capacity_ /= 100;
-    // io_zones[3]->capacity_ /= 100;
-    // io_zones[4]->capacity_ /= 100;
-    key_sst_zones_.push_back(io_zones[2]);
-    key_sst_zones_.push_back(io_zones[3]);
-    key_sst_zones_.push_back(io_zones[4]);
+  void InitWALZones();
 
-    // (xzw): should restore the correct active zone
-    // (kqh): Continue writing the zone that has been written already
-    active_aggr_keysst_zone_ = io_zones[2]->IsEmpty() ? 1 : 0;
+  void InitKeySSTZones();
 
-    // Pre-allocate one open and active token for key sst zone
-    auto token = GetActiveIOZoneTokenIfAvailable();
-    assert(token);
-    WaitForOpenIOZoneToken(false);
+  // Enqueue all empty zones except for special zones
+  // (i.e. Meta Zone, WAL Zone, KeySST Zone)
+  void InitEmptyZoneQueue();
 
-    keysst_aggr_zone_open_count_.store(1);
-    keysst_aggr_zone_active_count_.store(1);
+  // -------- KeySST Zone Allocation related functions ---------------//
 
-    keysst_disaggr_zone_open_count_.store(0);
-    keysst_disaggr_zone_active_count_.store(0);
+  IOStatus AllocateKeySSTZone(Zone **out_zone, KeySSTZoneAllocationHint *hint);
+  IOStatus ResetUnusedKeySSTZones();
+  // ------------------------------------------------------------------
 
-    is_disaggr_zone_written_.store(false);
+  // ------------ WAL Zone Allocation related functions ---------------//
+  IOStatus AllocateWALZone(Zone **out_zone, WALZoneAllocationHint *hint);
 
-    ZnsLogKeySSTZoneToken();
-  }
+  // [kqh] Switch current active WAL Zone
+  IOStatus SwitchWALZone();
+  // ------------------------------------------------------------------//
 
-  void InitializeZoneGCStats() {
-    // For simplicity, the gc stats table is initialized to be a bare state on
-    // each Open invoke. This has no relevance to the effect of our GC/placement
-    // strategy if we only run it once.
-    // However, GC stats table needs to be persisted on each update and are
-    // supposed to be intialized from persistent records to achive a full
-    // functionality.
+  // Get one empty zone from empty zone queue. This function is thread-safe.
+  // Return nullptr if no empty zone is available
+  zone_id_t PopEmptyZone();
 
-    for (int i = 0; i < nr_zones_; ++i) {
-      zone_gc_stats_map_.emplace(i, i);
-    }
-  }
+  // Push a zone into the empty zone queue. This function is thread-safe
+  // Abort if the target zone is already in empty queue
+  void PushEmptyZone(zone_id_t zone);
+
+  // Get the zone struct using according zone id.
+  Zone *GetZone(zone_id_t zone_id);
+
+  void InitializeZoneGCStats();
 
   void ZnsLogKeySSTZoneToken() {
     ZnsLog(kMagenta,
@@ -488,6 +595,15 @@ class ZonedBlockDevice {
   }
 
   IOStatus MigrateAggregatedLevelZone();
+
+  // ----------------------- Value SST Management ------------------------- //
+
+  // Initialize the states of each partition (Hot/Warm partition, hash
+  // partition). For current implementation, each partition is initialized
+  // assuming the ZonedBlockDevice is in a bare state. However, the zone states
+  // of each partition needs to be persist and the implementation of this
+  // initialization reads these persistent records
+  void InitializePartitions();
 
   // ===========================================================
   // =========== Bytedance Project Development (END) ==================
@@ -507,9 +623,13 @@ class ZonedBlockDevice {
 
   bool IsSpecialZone(const Zone *zone) {
     bool is_wal_zone = zone->ZoneId() == 3 || zone->ZoneId() == 4;
-    bool is_keysst_zone =
-        zone->ZoneId() == 5 || zone->ZoneId() == 6 || zone->ZoneId() == 7;
+    bool is_keysst_zone = zone->ZoneId() >= 5 && zone->ZoneId() <= 8;
     return is_wal_zone || is_keysst_zone;
+  }
+
+  bool IsValueSSTZone(const Zone *zone) {
+    return zone->ZoneId() >= 9 && zone->ZoneId() <= 95;
+    return false;
   }
 
   static bool IsAggregatedLevel(int level) {

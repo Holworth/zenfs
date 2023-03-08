@@ -9,7 +9,9 @@
 #include <cstdint>
 
 #include "fs/metrics.h"
+#include "rocksdb/env.h"
 #include "rocksdb/slice.h"
+#include "util/filename.h"
 #if !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 
 #include <errno.h>
@@ -80,6 +82,9 @@ class ZoneFile {
   uint64_t file_size_;
   uint64_t file_id_;
   uint64_t level_;
+  // The placement hint passed above. Only valid when current file type is
+  // ValueSST.
+  PlacementFileType place_ftype_;
 
   // xzw: Since we do not allow files to span multiple zones
   // we use this field to track the zone that this file
@@ -119,6 +124,14 @@ class ZoneFile {
   IOStatus BufferedAppendAtomic(char* data, uint32_t size);
   IOStatus AppendAtomic(void* buffer, int data_size);
 
+  // Append the specified data slice of a value sst in a zone. Since a value
+  // SST might be a flush SST or an output file of a GC task. This function
+  // needs different dealing approach
+  IOStatus ValueSSTAppend(char* data, uint32_t size);
+
+  // Get the corresponding partition according to current file type
+  std::shared_ptr<ZonedBlockDevice::ZonePartition> GetPartition();
+
   IOStatus SetWriteLifeTimeHint(Env::WriteLifeTimeHint lifetime);
   void SetIOType(IOType io_type);
   std::string GetFilename();
@@ -135,6 +148,9 @@ class ZoneFile {
   // ============================================================================
   uint64_t GetLevel() const;
   void SetLevel(uint64_t level);
+
+  PlacementFileType GetPlacementFileType() const;
+  void SetPlacementFileType(PlacementFileType ftype);
 
   bool IsKeySST() const {
     return (io_type_ == IOType::kFlushFile ||
@@ -158,11 +174,21 @@ class ZoneFile {
   void RecordWrite(uint64_t size) const {
     if (IsKeySST()) {
       zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kKeySST);
+      if (level_ == 0) {
+        zbd_->GetXMetrics()->RecordWriteBytes(size,
+                                              XZenFSMetricsType::kKeySSTFlush);
+      } else {
+        zbd_->GetXMetrics()->RecordWriteBytes(
+            size, XZenFSMetricsType::kKeySSTCompaction);
+      }
     } else if (IsValueSST()) {
       zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kValueSST);
       if (IsGCOutputValueSST()) {
         zbd_->GetXMetrics()->RecordWriteBytes(size,
-                                              XZenFSMetricsType::kGCWrite);
+                                              XZenFSMetricsType::kValueSSTGC);
+      } else {
+        zbd_->GetXMetrics()->RecordWriteBytes(
+            size, XZenFSMetricsType::kValueSSTFlush);
       }
     } else if (IsWAL()) {
       zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kWAL);
@@ -170,6 +196,13 @@ class ZoneFile {
   }
 
   Zone* GetBelongedZone() { return belonged_zone_; }
+
+  // An approximation of the size of current file. For simplicity we use a hard
+  // coding here. However, the reasonable approach is to read the exact size of
+  // value sst from the dboption. 
+  // The DBOptions set a limit for the blob file size, however, do all blob 
+  // files obey this limitation? 
+  size_t ApproximateFileSize() { return (32 * 1024ULL * 1024ULL); }
 
   // ============================================================================
   //  Modification End

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <memory>
 #include <set>
 #include <thread>
 
@@ -34,6 +35,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -188,12 +190,12 @@ IOStatus Zone::Append(char *data, uint32_t size, bool is_gc) {
     assert(wp_ <= start_ + max_capacity_);
   }
 
-  zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kTotal);
+  zbd_->GetXMetrics()->RecordWriteBytes(size, XZenFSMetricsType::kZNSWrite);
 
   return IOStatus::OK();
 }
 
-inline IOStatus Zone::CheckRelease() {
+IOStatus Zone::CheckRelease() {
   if (!Release()) {
     assert(false);
     return IOStatus::Corruption("Failed to unset busy flag of zone " +
@@ -403,33 +405,121 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
     }
   }
 
-  // (kqh) Use a few empty zones for provisioning
-  /*
-  for (auto z : io_zones) {
-    if (z->IsEmpty() && provisioning_zones.size() < nr_provisioning_zones_) {
-      provisioning_zones.emplace_back(z);
-      z->SetProvisioningFlag(true);
-    }
-    if (provisioning_zones.size() >= nr_provisioning_zones_) {
-      break;
-    }
-  }
-
-  printf("[kqh] Over-provisioning Zones: \n");
-  for (const auto &z : provisioning_zones) {
-    printf("[kqh]: %s\n", z->ToString().c_str());
-  }
-  */
-
-  GetZonesForWALAllocation();
-  GetZonesForKeySSTAllocation();
+  InitWALZones();
+  InitKeySSTZones();
+  InitEmptyZoneQueue();
 
   InitializeZoneGCStats();
+
+  InitializePartitions();
 
   free(zone_rep);
   start_time_ = time(NULL);
 
   return IOStatus::OK();
+}
+
+void ZonedBlockDevice::InitWALZones() {
+  // Always use the first two zones for WAL allocation
+  wal_zones_.push_back(io_zones[0]);
+  wal_zones_.push_back(io_zones[1]);
+
+  wal_zone_active_count_.store(0);
+  wal_zone_open_count_.store(0);
+}
+
+void ZonedBlockDevice::InitKeySSTZones() {
+  // Always use 4 zones preceding wal zones for KeySST allocation
+  // The first 3 zones is used to store aggregated level key SSTs.
+  //  * One activated aggregated zone and two backup zone preparing for
+  //    migration. The reason why we use two backup zones is that the
+  //    victim zone may fail to be reset as being written.
+  key_sst_zones_.push_back(io_zones[2]);
+  key_sst_zones_.push_back(io_zones[3]);
+  key_sst_zones_.push_back(io_zones[4]);
+
+  key_sst_zones_.push_back(io_zones[5]);
+
+  // (xzw): should restore the correct active zone
+  // (kqh): Continue writing the zone that has been written already
+  active_aggr_keysst_zone_ = io_zones[2]->IsEmpty() ? 1 : 0;
+
+  // Pre-allocate one open and active token for key sst zone
+  auto token = GetActiveIOZoneTokenIfAvailable();
+  assert(token);
+  WaitForOpenIOZoneToken(false);
+
+  keysst_aggr_zone_open_count_.store(1);
+  keysst_aggr_zone_active_count_.store(1);
+
+  keysst_disaggr_zone_open_count_.store(0);
+  keysst_disaggr_zone_active_count_.store(0);
+
+  is_disaggr_zone_written_.store(false);
+
+  ZnsLogKeySSTZoneToken();
+}
+
+void ZonedBlockDevice::InitializeZoneGCStats() {
+  // For simplicity, the gc stats table is initialized to be a bare state on
+  // each Open invoke. This has no relevance to the effect of our GC/placement
+  // strategy if we only run it once.
+  // However, GC stats table needs to be persisted on each update and are
+  // supposed to be intialized from persistent records to achive a full
+  // functionality.
+
+  for (int i = 0; i < nr_zones_; ++i) {
+    zone_gc_stats_map_.emplace(i, i);
+  }
+}
+
+void ZonedBlockDevice::InitializePartitions() {
+  // TODO: Initialize Hot/Warm partition
+  // Initialize each partition assuming the device is in a bare state.
+  for (uint32_t i = 0; i < partition_num; ++i) {
+    hash_partitions_[i] =
+        std::make_shared<HashPartition>(std::unordered_set<zone_id_t>(), this);
+    hash_partitions_[i]->SetActivateZone(kInvalidZoneId);
+  }
+}
+
+void ZonedBlockDevice::InitEmptyZoneQueue() {
+  for (const auto zone : io_zones) {
+    if (zone->IsEmpty() && !IsSpecialZone(zone)) {
+      empty_zones_.push_back(zone->ZoneId());
+    }
+  }
+}
+
+// Get one empty zone from empty zone queue. This function must be thread-safe
+zone_id_t ZonedBlockDevice::PopEmptyZone() {
+  std::lock_guard<std::mutex> lck(empty_zone_mtx_);
+  if (empty_zones_.empty()) {
+    return kInvalidZoneId;
+  }
+  auto ret = empty_zones_.front();
+  empty_zones_.pop_front();
+  return ret;
+}
+
+// Push a zone into the empty zone queue. This function must be thread-safe
+void ZonedBlockDevice::PushEmptyZone(zone_id_t zone_id) {
+  std::lock_guard<std::mutex> lck(empty_zone_mtx_);
+  assert(std::find(empty_zones_.begin(), empty_zones_.end(), zone_id) ==
+         empty_zones_.end());
+  empty_zones_.push_back(zone_id);
+}
+
+Zone *ZonedBlockDevice::GetZone(zone_id_t zone_id) {
+  // Notice that the first a few zones are used for meta data storage and the
+  // zone_id starts from the first zone of the ZonedBlockDevice
+  if (zone_id == kInvalidZoneId || zone_id < meta_zones.size()) {
+    return nullptr;
+  }
+  auto id_in_io_zones = zone_id - meta_zones.size();
+  auto ret = io_zones[id_in_io_zones];
+  assert(ret->ZoneId() == zone_id);
+  return ret;
 }
 
 uint64_t ZonedBlockDevice::GetFreeSpace() {
@@ -616,7 +706,7 @@ IOStatus ZonedBlockDevice::AllocateMetaZone(Zone **out_meta_zone) {
 IOStatus ZonedBlockDevice::ResetUnusedIOZones() {
   // TODO: Some zones may need to used for provisioning
   for (const auto z : io_zones) {
-    if (IsSpecialZone(z)) {
+    if (IsSpecialZone(z) || IsValueSSTZone(z)) {
       continue;
     }
 
@@ -724,7 +814,7 @@ IOStatus ZonedBlockDevice::ApplyFinishThreshold() {
   if (finish_threshold_ == 0) return IOStatus::OK();
 
   for (const auto z : io_zones) {
-    if (IsSpecialZone(z)) {
+    if (IsSpecialZone(z) || IsValueSSTZone(z)) {
       continue;
     }
 
@@ -759,7 +849,7 @@ IOStatus ZonedBlockDevice::FinishCheapestIOZone() {
   Zone *finish_victim = nullptr;
 
   for (const auto z : io_zones) {
-    if (IsSpecialZone(z)) {
+    if (IsSpecialZone(z) || IsValueSSTZone(z)) {
       continue;
     }
 
@@ -818,7 +908,7 @@ IOStatus ZonedBlockDevice::GetBestOpenZoneMatch(
          WriteHintToString(file_lifetime).c_str());
 
   for (const auto z : io_zones) {
-    if (IsSpecialZone(z)) {
+    if (IsSpecialZone(z) || IsValueSSTZone(z)) {
       continue;
     }
 
@@ -870,7 +960,7 @@ IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out) {
   IOStatus s;
   Zone *allocated_zone = nullptr;
   for (const auto z : io_zones) {
-    if (IsSpecialZone(z)) {
+    if (IsSpecialZone(z) || IsValueSSTZone(z)) {
       continue;
     }
 
@@ -1305,8 +1395,28 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
     return IOStatus::OK();
   }
 
+  // Reset any possible unused zone before migration
+  ResetUnusedKeySSTZones();
+
   assert(src_zone->IsBusy());
-  auto next_zone = (active_aggr_keysst_zone_ + 1) % 2;
+
+  // Find an empty zone that can accommadate migrated extents
+  // auto next_zone = (active_aggr_keysst_zone_ + 1) % 2;
+  auto next_zone = active_aggr_keysst_zone_;
+  for (int i = 1; i < 3; ++i) {
+    auto idx = (next_zone + i) % 3;
+    if (key_sst_zones_[idx]->IsEmpty()) {
+      next_zone = (next_zone + i) % 3;
+      break;
+    }
+  }
+
+  // Migration fails: no empty zone can be used as migration destination
+  if (next_zone == active_aggr_keysst_zone_) {
+    assert(false);
+    abort();
+  }
+
   auto dst_zone = key_sst_zones_[next_zone];
 
   ZnsLog(Color::kBlue, "[xzw] Migrating from zone %d to zone %d",
@@ -1345,7 +1455,7 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
 
   // Change current active zone must be done when src_zone is locked.
 
-  active_aggr_keysst_zone_ = (active_aggr_keysst_zone_ + 1) % 2;
+  active_aggr_keysst_zone_ = next_zone;
   ZnsLog(Color::kRed, "Updating active_aggr_keysst_zone_ to %d in superblock",
          active_aggr_keysst_zone_);
 
@@ -1435,7 +1545,7 @@ void ZonedBlockDevice::SetZoneDeferredStatus(IOStatus status) {
 
 void ZonedBlockDevice::GetZoneSnapshot(std::vector<ZoneSnapshot> &snapshot) {
   for (auto *zone : io_zones) {
-    // [kqh]: Ignore special zone since a GC job might operate on zones
+    // (XZW): Ignore special zone since a GC job might operate on zones
     // reported from this function. However, the reclaimation of WALZone and
     // KeySSTZone are handled internally by ZenFS instead of DB. We ignore
     // these special zones to avoid DB reclaimed them.

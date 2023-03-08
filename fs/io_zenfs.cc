@@ -279,6 +279,7 @@ ZoneFile::ZoneFile(ZonedBlockDevice* zbd, uint64_t file_id)
       file_size_(0),
       file_id_(file_id),
       level_(uint64_t(-1)),
+      place_ftype_(PlacementFileType::NoType()),
       belonged_zone_(nullptr),
       nr_synced_extents_(0),
       m_time_(0) {}
@@ -294,6 +295,14 @@ void ZoneFile::SetIOType(IOType io_type) { io_type_ = io_type; }
 // (xzw): level accessors
 uint64_t ZoneFile::GetLevel() const { return level_; }
 void ZoneFile::SetLevel(uint64_t level) { level_ = level; }
+
+// (xzw): Placement hint
+PlacementFileType ZoneFile::GetPlacementFileType() const {
+  return place_ftype_;
+}
+void ZoneFile::SetPlacementFileType(PlacementFileType ftype) {
+  place_ftype_ = ftype;
+}
 
 ZoneFile::~ZoneFile() {
   ClearExtents();
@@ -336,6 +345,12 @@ IOStatus ZoneFile::CloseActiveZone() {
     s = active_zone_->Close();
     ReleaseActiveZone();
     if (!s.ok()) {
+      return s;
+    }
+    // (kqh): For value sst, there is no need to return active or open token
+    // on file close. Each partition (Hot/Warm/Partition) occupies an active and
+    // open zone for the whole time
+    if (IsValueSST()) {
       return s;
     }
     zbd_->PutOpenIOZoneToken();
@@ -514,6 +529,9 @@ IOStatus ZoneFile::AllocateNewZone() {
   Zone* zone;
   IOStatus s = zbd_->AllocateIOZone(lifetime_, io_type_, &zone);
 
+  if (this->active_zone_) {
+    assert(zone->ZoneId() == this->active_zone_->ZoneId());
+  }
   if (!s.ok()) return s;
   if (!zone) {
     ZnsLog(kRed, "[kqh] File(%s) Allocate Zone Failed",
@@ -585,7 +603,7 @@ IOStatus ZoneFile::AllocateNewZoneForWrite(size_t size) {
 IOStatus ZoneFile::BufferedAppendAtomic(char* buffer, uint32_t data_size) {
   WriteLock lck(this);
 
-  ZnsLog(kGreen, "[File %s] call BufferedAppendAtomic (size=%llu)",
+  ZnsLog(kDisableLog, "[File %s] call BufferedAppendAtomic (size=%llu)",
          GetFilename().c_str(), data_size);
 
   uint32_t wr_size = data_size;
@@ -669,7 +687,7 @@ IOStatus ZoneFile::BufferedAppend(char* buffer, uint32_t data_size) {
     uint64_t extent_length = wr_size;
 
     ZnsLog(
-        kCyan,
+        kDisableLog,
         "[kqh] File(%s) BufferedAppend %lf MiB to Zone(%d), FileSize %lf MiB",
         GetFilename().c_str(), ToMiB(wr_size + pad_sz), active_zone_->ZoneId(),
         ToMiB(file_size_));
@@ -780,10 +798,155 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
   return IOStatus::OK();
 }
 
+IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
+  assert(IsValueSST());
+
+  uint32_t left = data_size;
+  uint32_t wr_size, offset = 0;
+  IOStatus s = IOStatus::OK();
+
+  if (!active_zone_) {
+    // Pick one zone to write according to its placement file type
+    auto partition = GetPartition();
+
+    //
+    // Pick a zone for writing accordingly:
+    //
+    //   * For normal flush value sst, just pick current activated zone and
+    //     switch the activated zone if necessary (i.e. no enough space to
+    //     write).
+    //
+    //   * For GC output sst, find a bunch of new zones to write.
+    //
+    // In most case, there is only one thread writing flush SST or GC SST
+    // for each partition.
+    //
+
+    Zone* write_zone = nullptr;
+    if (!IsGCOutputValueSST()) {
+      bool need_new_zone = false;
+      auto zone_id = partition->GetActivatedZone();
+      auto prev_zone = zbd_->GetZone(zone_id);
+      // This partition has no activated zone yet
+      if (prev_zone == nullptr) {
+        need_new_zone = true;
+      } else {
+        prev_zone->LoopForAcquire();
+        // This approximation might not be accurate. For BufferedAppend, there
+        // might be some extra space for padding.
+        if (prev_zone->GetCapacityLeft() < ApproximateFileSize()) {
+          need_new_zone = true;
+        }
+      }
+
+      // Use the previous activate zone for write
+      if (!need_new_zone) {
+        write_zone = prev_zone;
+      } else {
+        // Release the prev zone if it's not nullptr
+        // We do not need to release active and open token since it can be
+        // reused for next chosen activate zone
+        if (prev_zone) {
+          bool full = prev_zone->IsFull();
+          s = prev_zone->Close();
+          prev_zone->CheckRelease();
+          if (!s.ok()) {
+            return s;
+          }
+        } else {
+          // No activate zone yet, ask for active and open token
+          while (!zbd_->GetActiveIOZoneTokenIfAvailable())
+            ;
+          zbd_->WaitForOpenIOZoneToken(true);
+        }
+        auto new_zone_id = zbd_->PopEmptyZone();
+        if (new_zone_id == kInvalidZoneId) {
+          return IOStatus::NoSpace("ValueSST acquire empty zone Failed");
+        }
+
+        auto new_zone = zbd_->GetZone(new_zone_id);
+        partition->AddZone(new_zone_id);
+        partition->SetActivateZone(new_zone_id);
+
+        if (prev_zone) {
+          ZnsLog(kCyan,
+                 "Partition(%d) Switch ActivateZone From Zone%lu(%lu MiB) to "
+                 "Zone%lu(%lu MiB)",
+                 place_ftype_.PartitionId(), zone_id,
+                 ToMiB(prev_zone->GetCapacityLeft()), new_zone_id,
+                 ToMiB(new_zone->GetCapacityLeft()));
+        }
+
+        new_zone->LoopForAcquire();
+        write_zone = new_zone;
+      }
+    } else {
+      // TODO: Dealing with the case of GC file
+    }
+    // Set all related meta data
+    SetActiveZone(write_zone);
+    SetBelongedZone(write_zone);
+    extent_start_ = active_zone_->wp_;
+    extent_filepos_ = file_size_;
+    PersistMetadata();
+  }
+  assert(active_zone_ != nullptr);
+
+  // This implementation causes this file occupy this zone exclusively. In our
+  // design, we expect there is only one thread flushing the memtable. Multiple
+  // threads flushing the memtable would require assign zone for each flush
+  // thread.
+  while (left) {
+    // NOTE: We do not allow switching zone cause we require the value sst to
+    // be completely written in a single zone
+    if (active_zone_->capacity_ == 0) {
+      assert(false);
+    }
+
+    wr_size = left;
+    if (wr_size > active_zone_->capacity_) {
+      // write across zone is not allowed
+      assert(false);
+    }
+
+    ZnsLog(
+        kDisableLog,
+        "[kqh] File(%s) ValueSSTAppend %lf MiB to Zone(%d), FileSize %lf MiB",
+        GetFilename().c_str(), ToMiB(wr_size), active_zone_->ZoneId(),
+        ToMiB(file_size_));
+
+    s = active_zone_->Append((char*)data + offset, wr_size);
+    if (!s.ok()) return s;
+
+    RecordWrite(wr_size);
+
+    file_size_ += wr_size;
+    left -= wr_size;
+    offset += wr_size;
+  }
+  return IOStatus::OK();
+}
+
+std::shared_ptr<ZonedBlockDevice::ZonePartition> ZoneFile::GetPartition() {
+  if (place_ftype_.IsHot()) {
+    return zbd_->hot_partition_;
+  } else if (place_ftype_.IsWarm()) {
+    return zbd_->hot_partition_;
+  } else if (place_ftype_.IsParition()) {
+    return zbd_->hash_partitions_[place_ftype_.PartitionId()];
+  } else {
+    return nullptr;
+  }
+}
+
 /* Assumes that data and size are block aligned */
 IOStatus ZoneFile::Append(void* data, int data_size) {
+  // Different write path according to the specific file type
   if (IsKeySST()) {
     return AppendAtomic(data, data_size);
+  }
+  if (IsValueSST()) {
+    return ValueSSTAppend((char*)data, data_size);
   }
 
   WriteLock lck(this);
@@ -860,6 +1023,7 @@ IOStatus ZoneFile::AppendAtomic(void* buffer, int data_size) {
 
   RecordWrite(wr_size);
 
+  // For AppendAtomic, construct an extent for each invoke.
   extents_.push_back(
       new ZoneExtent(extent_start_, extent_length, active_zone_));
   active_zone_->used_capacity_ += extent_length;
@@ -1039,7 +1203,6 @@ void ZoneFile::SetBelongedZone(Zone* zone) {
   belonged_zone_ = zone;
 }
 
-
 ZenFSMetricsHistograms ZoneFile::GetReportType() const {
   ZenFSMetricsHistograms type;
   switch (GetIOType()) {
@@ -1136,7 +1299,7 @@ IOStatus ZonedWritableFile::DataSync() {
   if (buffered) {
     IOStatus s;
     buffer_mtx_.lock();
-    ZnsLog(kRed, "[ZonedWritableFile::DataSync()] %s",
+    ZnsLog(kDisableLog, "[ZonedWritableFile::DataSync()] %s",
            zoneFile_->GetFilename().c_str());
     /* Flushing the buffer will result in a new extent added to the list*/
     s = FlushBuffer();
@@ -1420,8 +1583,8 @@ IOStatus ZoneFile::ReadData(uint64_t offset, uint32_t length, Slice* data) {
 // (kqh): TODO: May add throughput reporter here to record migration throughput
 IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
                                Zone* target_zone) {
-  ZnsLog(kBlue, "[kqh] Migrate Data: offset(%zu) len(%u) to ZoneId(%d)",
-         offset, length, target_zone->ZoneId());
+  ZnsLog(kBlue, "[kqh] Migrate Data: offset(%zu) len(%u) to ZoneId(%d)", offset,
+         length, target_zone->ZoneId());
 
   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_GC_READ_THROUGHPUT, length);
   uint32_t step = 128 << 10;

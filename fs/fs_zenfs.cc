@@ -814,6 +814,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
       result->reset(new ZonedWritableFile(zbd_, !file_opts.use_direct_writes,
                                           zoneFile, &metadata_writer_));
       (*result)->SetFileLevel(zoneFile->GetLevel());
+      (*result)->SetPlacementFileType(zoneFile->GetPlacementFileType());
       return IOStatus::OK();
     }
 
@@ -834,6 +835,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     //        SST
     if (*result) {
       zoneFile->SetLevel((*result)->GetFileLevel());
+      zoneFile->SetPlacementFileType((*result)->GetPlacementFileType());
     }
     /* RocksDB does not set the right io type(!)*/
     if (ends_with(fname, ".log")) {
@@ -857,6 +859,7 @@ IOStatus ZenFS::OpenWritableFile(const std::string& filename,
     result->reset(new ZonedWritableFile(zbd_, !file_opts.use_direct_writes,
                                         zoneFile, &metadata_writer_));
     (*result)->SetFileLevel(zoneFile->GetLevel());
+    (*result)->SetPlacementFileType(zoneFile->GetPlacementFileType());
   }
 
   if (resetIOZones) s = zbd_->ResetUnusedIOZones();
@@ -1328,7 +1331,24 @@ Status ZenFS::RecoverFrom(ZenMetaLog* log) {
     return Status::NotFound("ZenFS", "No snapshot found");
 }
 
-void ZenFS::Dump() { zbd_->GetXMetrics()->Dump(""); }
+void ZenFS::Dump() {
+  zbd_->GetXMetrics()->Dump("");
+  DumpZoneGCStats();
+}
+
+void ZenFS::DumpZoneGCStats() {
+  std::ofstream of;
+  of.open("gc_stats");
+
+  // Dump the status of each partition
+  for (int i = 0; i < zbd_->partition_num; ++i) {
+    of << "[Partition" << i << "]:\n";
+    of << zbd_->hash_partitions_[i]->Dump();
+    of << "\n";
+  }
+
+  of.close();
+}
 
 /* Mount the filesystem by recovering form the latest valid metadata zone */
 Status ZenFS::Mount(bool readonly) {
@@ -2038,6 +2058,38 @@ void ZenFS::UpdateCompactionIterStats(
   }
 }
 
+void ZenFS::UpdateTableProperties(const std::string& fname,
+                                  const TableProperties* tbl_prop) {
+  ZnsLog(kCyan,
+         "[=================== ZenFS:UpdateTableProperties] ==============");
+  auto file = GetFile(fname);
+  assert(file != nullptr);
+
+  // No need to update the table properties if it is a key sst
+  if (file->IsKeySST()) {
+    return;
+  }
+
+  auto zone = file->GetBelongedZone();
+
+  // Maybe this file still does not have a belonged zone yet? It requires this
+  // function to be invoked at an appropriate timepoint
+
+  //
+  // xzw: The BlockBasedTableBuilder::Finish writes down a seies metadata
+  //      as shown in block_based_table_builder.cc:923~932. A call to Append
+  //      is called and the Append can be buffered. But with direct IO one,
+  //      each Append call results in one Flush and the Flush further calls
+  //      PositionedAppend, which will further forward to
+  //      ZenFS::PositionedAppend
+  assert(zone != nullptr);
+  auto zone_gc_stats = zbd_->GetZoneGCStatsOf(zone->ZoneId());
+
+  zone_gc_stats->no_blobs += 1;
+  zone_gc_stats->no_kv += tbl_prop->num_entries;
+  zone_gc_stats->no_valid_kv += tbl_prop->num_entries;
+}
+
 // Migrate a given file and associated migration extents
 IOStatus ZenFS::MigrateFileExtents(
     const std::string& fname,
@@ -2055,10 +2107,10 @@ IOStatus ZenFS::MigrateFileExtents(
   // The file may be deleted by other threads, better double check.
   auto zfile = GetFile(fname);
   if (zfile == nullptr || zfile->IsOpenForWR()) {
-    // if (zfile && zfile->IsOpenForWR()) {
-    //   ZnsLog(kRed, "File (%s) IsOpenForWR, failed to migrate",
-    //          zfile->GetFilename().c_str());
-    // }
+    if (zfile && zfile->IsOpenForWR()) {
+      ZnsLog(kRed, "File (%s) IsOpenForWR, failed to migrate",
+             zfile->GetFilename().c_str());
+    }
     return IOStatus::OK();
   }
 
