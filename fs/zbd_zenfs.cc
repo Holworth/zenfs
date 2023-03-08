@@ -405,6 +405,8 @@ IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
     }
   }
 
+  zone_graphs_.Init(nr_zones_);
+
   InitWALZones();
   InitKeySSTZones();
   InitEmptyZoneQueue();

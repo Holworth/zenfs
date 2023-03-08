@@ -8,6 +8,7 @@
 
 #include <cstdint>
 
+#include "db/compaction.h"
 #include "db/compaction_iteration_stats.h"
 #include "fs/log.h"
 #include "rocksdb/io_status.h"
@@ -481,6 +482,9 @@ class ZenFS : public FileSystemWrapper {
 
   void UpdateCompactionIterStats(
       const CompactionIterationStats* iter_stat) override;
+  
+  void UpdateZoneGCStats(const CompactionIterationStats* iter_stat);
+  void UpdateZoneDeprecationGraph(const CompactionIterationStats* iter_stat);
 
   void UpdateTableProperties(const std::string& fname,
                              const TableProperties* tbl_prop) override;

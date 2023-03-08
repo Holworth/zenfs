@@ -206,6 +206,7 @@ struct ZenFSMetricsLatencyGuard {
 // ====================================================================
 
 enum XZenFSMetricsType : uint32_t {
+  // Write Record
   kWAL,
 
   kKeySST,
@@ -220,6 +221,7 @@ enum XZenFSMetricsType : uint32_t {
 
   kZNSWrite,
 
+  // Space Record
   kOccupySpace,
   kUsedSpace,
   kFreeSpace,

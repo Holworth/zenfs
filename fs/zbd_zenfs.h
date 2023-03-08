@@ -132,14 +132,7 @@ struct ZoneGCStats {
   std::atomic<uint64_t> no_blobs;
   std::atomic<uint64_t> no_kv;  // avoid float exception
   std::atomic<uint64_t> no_valid_kv;
-
-  // calculated as size_of_total_valid_blobs / used_capacity
-  // for experiments, the values are fixed-sized, thus we use
-  // valid kv count and total kv count instead size for GC
-  double gc_ratio = 0.0;
-
-  // used capacity is not recorded, ZenFS can locate such information
-  // by looking for a zone in the ZonedBlockDevice
+  std::atomic<uint64_t> wasted_size;  // space unused when Finish()
 
   // A Clear() interface reset the recorded states of the zone. It is used
   // when a gc task is finished
@@ -147,15 +140,16 @@ struct ZoneGCStats {
     no_blobs = 0;
     no_kv = 1;
     no_valid_kv = 0;
-    gc_ratio = 0.0;
+    wasted_size = 0;
   }
 
   std::string Dump() {
     char buf[512];
     sprintf(buf,
-            "[Zone: %lu][NoBlob: %lu][NoKV: %lu][NoValidKV: %lu][GR: %.2lf]",
-            zone_id, no_blobs.load(), no_kv.load(), no_valid_kv.load(),
-            GarbageRatio());
+            "[Zone: %lu][Wasted: %.2lf MiB][NoBlob: %lu][NoKV: %lu][NoValidKV: "
+            "%lu][GR: %.2lf]",
+            zone_id, ToMiB(wasted_size.load()), no_blobs.load(), no_kv.load(),
+            no_valid_kv.load(), GarbageRatio());
     return std::string(buf);
   }
 
@@ -274,25 +268,49 @@ class ZonedBlockDevice {
 
   // ------------------- Garbage Related Management ---------------------- //
 
+  // ZoneDeprecationGraph is a strcture that depicts the deprecation
+  // relationship between zones. An edge <<src, dst>, num> means Zone(src)
+  // deprecates num records in Zone(dst) This structure is used to calculate a
+  // "good" approximation of garbages across zones
+  struct ZoneDeprecationGraph {
+    using GraphNode = cuckoohash_map<zone_id_t, uint64_t>;
+
+    uint64_t zone_num;
+    std::vector<std::shared_ptr<GraphNode>> graphs;
+
+    ZoneDeprecationGraph() = default;
+    ~ZoneDeprecationGraph() = default;
+
+    // This can be only called once
+    void Init(uint32_t _zone_num) {
+      zone_num = _zone_num;
+      graphs.assign(_zone_num, nullptr);
+    }
+
+    void AddEdgeWeight(zone_id_t src, zone_id_t dst, uint64_t num) {
+      if (graphs[src] == nullptr) {
+        graphs[src] = std::make_shared<GraphNode>();
+      }
+      if (!graphs[src]->update_fn(dst, [&](auto &d) { d += num; })) {
+        graphs[src]->insert(dst, num);
+      }
+    }
+
+    void Clear(zone_id_t src, zone_id_t dst) {
+      auto p = graphs[src];
+      p->update_fn(dst, [](auto &d) { d = 0; });
+    }
+
+    uint64_t GetEdgeWeight(zone_id_t src, zone_id_t dst) {
+      auto p = graphs[src];
+      uint64_t ret = 0;
+      return p->find(dst, ret) ? ret : 0;
+    }
+  };
+
   // maps from zone ID to zone GC stats
   std::unordered_map<zone_id_t, ZoneGCStats> zone_gc_stats_map_;
-
-  // A strcture that depicts the deprecation relationship between zones. An
-  // edge <<src, dst>, num> means Zone(src) deprecates num records in Zone(dst)
-  // This structure is used to calculate a "good" approximation of garbages
-  // across zones
-  struct ZoneDeprecationGraph {
-    uint64_t zone_num;
-    // Denote this graph
-    std::vector<std::shared_ptr<cuckoohash_map<zone_id_t, uint64_t>>> graphs;
-
-    ZoneDeprecationGraph(uint64_t _zone_num)
-        : zone_num(_zone_num), graphs(_zone_num, nullptr) {}
-
-    void AddEdge(zone_id_t src, zone_id_t dst, uint64_t num);
-    void Clear(zone_id_t src, zone_id_t dst);
-    uint64_t GetEdgeNum(zone_id_t src, zone_id_t dst);
-  };
+  ZoneDeprecationGraph zone_graphs_;
 
   // --------------------------------------------------------------------- //
 

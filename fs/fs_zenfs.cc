@@ -2039,10 +2039,12 @@ IOStatus ZenFS::MigrateFileExtentsWithFSLock(
 // Is this function thread-safe?
 void ZenFS::UpdateCompactionIterStats(
     const CompactionIterationStats* iter_stat) {
-  ZnsLog(
-      kCyan,
-      "[=================== ZenFS:UpdateCompactionIterStats] ==============");
+  UpdateZoneGCStats(iter_stat);
+  UpdateZoneDeprecationGraph(iter_stat);
+}
 
+void ZenFS::UpdateZoneGCStats(const CompactionIterationStats* iter_stat) {
+  ZnsLog(kCyan, "[============ ZenFS:UpdateZoneGCStats] ==========");
   for (const auto& [edge, count] : iter_stat->deprecated_count) {
     // XTODO: current this name works, but we need some other method
     // to generate correct names according to the dbname
@@ -2055,6 +2057,23 @@ void ZenFS::UpdateCompactionIterStats(
 
     auto zone_gc_stats = zbd_->GetZoneGCStatsOf(zone->ZoneId());
     zone_gc_stats->no_valid_kv -= count;
+  }
+}
+
+void ZenFS::UpdateZoneDeprecationGraph(
+    const CompactionIterationStats* iter_stat) {
+  ZnsLog(kCyan, "[=========== ZenFS:UpdateDepGraph] ==========");
+
+  for (const auto& [edge, count] : iter_stat->deprecated_count) {
+    auto src_fname = MakeTableFileName("/testdb", edge.first);
+    auto dst_fname = MakeTableFileName("/testdb", edge.second);
+
+    auto src_file = GetFile(src_fname), dst_file = GetFile(dst_fname);
+    if (src_file != nullptr && dst_file != nullptr) {
+      zbd_->zone_graphs_.AddEdgeWeight(src_file->GetBelongedZone()->ZoneId(),
+                                       dst_file->GetBelongedZone()->ZoneId(),
+                                       count);
+    }
   }
 }
 

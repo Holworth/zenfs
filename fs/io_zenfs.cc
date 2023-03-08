@@ -848,6 +848,13 @@ IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
         // reused for next chosen activate zone
         if (prev_zone) {
           bool full = prev_zone->IsFull();
+          zbd_->GetZoneGCStatsOf(zone_id)->wasted_size +=
+              prev_zone->GetCapacityLeft();
+          // Finish this zone when it has no enough space
+          s = prev_zone->Finish();
+          if (!s.ok()) {
+            return s;
+          }
           s = prev_zone->Close();
           prev_zone->CheckRelease();
           if (!s.ok()) {
