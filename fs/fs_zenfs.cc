@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 
@@ -1336,6 +1337,13 @@ void ZenFS::Dump() {
   DumpZoneGCStats();
 }
 
+// the out_args is used to store a uint64_t partition ID
+std::pair<std::unordered_set<uint64_t>, GenericHotness> 
+ZenFS::GetGCHintsFromFS(void *out_args) {
+  // XTODO: override this implementation;
+  return {{7, 7, 7}, {}};
+}
+
 void ZenFS::DumpZoneGCStats() {
   std::ofstream of;
   of.open("gc_stats");
@@ -1690,6 +1698,8 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.used_space, kUsedSpace);
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.free_space, kFreeSpace);
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.occupy_space, kOccupySpace);
+    zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr * 1000,
+                                               kPartitionGR);
   }
   if (options.zone_) {
     zbd_->GetZoneSnapshot(snapshot.zones_);
@@ -2070,9 +2080,16 @@ void ZenFS::UpdateZoneDeprecationGraph(
 
     auto src_file = GetFile(src_fname), dst_file = GetFile(dst_fname);
     if (src_file != nullptr && dst_file != nullptr) {
-      zbd_->zone_graphs_.AddEdgeWeight(src_file->GetBelongedZone()->ZoneId(),
-                                       dst_file->GetBelongedZone()->ZoneId(),
+      auto src_zone = src_file->GetBelongedZone();
+      auto dst_zone = dst_file->GetBelongedZone();
+      zbd_->zone_graphs_.AddEdgeWeight(src_zone->ZoneId(), dst_zone->ZoneId(),
                                        count);
+
+      // If deprecation happens between files in the same zone:
+      if (src_zone == dst_zone) {
+        auto gc_stat = zbd_->GetZoneGCStatsOf(src_zone->ZoneId());
+        gc_stat->in_zone_deprecated += count;
+      }
     }
   }
 }

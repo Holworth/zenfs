@@ -556,6 +556,16 @@ uint64_t ZonedBlockDevice::GetOccupySpace() {
   return occupy;
 }
 
+double ZonedBlockDevice::GetPartitionGR() {
+  uint64_t total_kv = 1, valid_kv = 1;
+  for (const auto& zone_id : hash_partitions_[0]->zones) {
+    auto gc_stat = GetZoneGCStatsOf(zone_id);
+    total_kv += gc_stat->no_kv;
+    valid_kv += gc_stat->no_valid_kv;
+  }
+  return 1 - (double)valid_kv / total_kv;
+}
+
 void ZonedBlockDevice::LogZoneStats() {
   uint64_t used_capacity = 0;
   uint64_t reclaimable_capacity = 0;

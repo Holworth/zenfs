@@ -34,6 +34,7 @@ class ZBDSnapshot {
   uint64_t used_space;
   uint64_t reclaimable_space;
   uint64_t occupy_space;
+  double partition_gr;
 
  public:
   ZBDSnapshot() = default;
@@ -42,7 +43,8 @@ class ZBDSnapshot {
       : free_space(zbd.GetFreeSpace()),
         used_space(zbd.GetUsedSpace()),
         reclaimable_space(zbd.GetReclaimableSpace()),
-        occupy_space(zbd.GetOccupySpace()) {}
+        occupy_space(zbd.GetOccupySpace()),
+        partition_gr(zbd.GetPartitionGR()) {}
 };
 
 class ZoneSnapshot {

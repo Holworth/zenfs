@@ -216,6 +216,9 @@ class ZenFS : public FileSystemWrapper {
 
   void Dump() override;
 
+  std::pair<std::unordered_set<uint64_t>, GenericHotness> GetGCHintsFromFS(
+      void* out_args) override;
+
   void DumpZoneGCStats();
 
   std::string ToAuxPath(std::string path) {
@@ -482,7 +485,7 @@ class ZenFS : public FileSystemWrapper {
 
   void UpdateCompactionIterStats(
       const CompactionIterationStats* iter_stat) override;
-  
+
   void UpdateZoneGCStats(const CompactionIterationStats* iter_stat);
   void UpdateZoneDeprecationGraph(const CompactionIterationStats* iter_stat);
 

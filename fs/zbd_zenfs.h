@@ -119,7 +119,7 @@ struct KeySSTZoneAllocationHint : public ZoneAllocationHint {
 // of microseconds, meanwhile, read/write takes only tens of microseconds
 struct ZoneGCStats {
   ZoneGCStats(zone_id_t id)
-      : zone_id(id), no_blobs(0), no_kv(1), no_valid_kv(0) {}
+      : zone_id(id), no_blobs(0), no_kv(1), no_valid_kv(0), wasted_size(0) {}
 
   ZoneGCStats() : ZoneGCStats(kInvalidZoneId) {}
   ~ZoneGCStats() = default;
@@ -133,6 +133,8 @@ struct ZoneGCStats {
   std::atomic<uint64_t> no_kv;  // avoid float exception
   std::atomic<uint64_t> no_valid_kv;
   std::atomic<uint64_t> wasted_size;  // space unused when Finish()
+  // number of records deprecated by other records placed in the same zone
+  std::atomic<uint64_t> in_zone_deprecated;
 
   // A Clear() interface reset the recorded states of the zone. It is used
   // when a gc task is finished
@@ -141,19 +143,23 @@ struct ZoneGCStats {
     no_kv = 1;
     no_valid_kv = 0;
     wasted_size = 0;
+    in_zone_deprecated = 0;
   }
 
   std::string Dump() {
     char buf[512];
     sprintf(buf,
             "[Zone: %lu][Wasted: %.2lf MiB][NoBlob: %lu][NoKV: %lu][NoValidKV: "
-            "%lu][GR: %.2lf]",
+            "%lu][GR: %.2lf][InZoneGR: %.2lf]",
             zone_id, ToMiB(wasted_size.load()), no_blobs.load(), no_kv.load(),
-            no_valid_kv.load(), GarbageRatio());
+            no_valid_kv.load(), GarbageRatio(), InZoneGarbageRatio());
     return std::string(buf);
   }
 
   double GarbageRatio() const { return 1 - (double)no_valid_kv / no_kv; }
+  double InZoneGarbageRatio() const {
+    return (double)in_zone_deprecated / no_kv;
+  }
 };
 
 class Zone {
@@ -431,7 +437,7 @@ class ZonedBlockDevice {
 
   std::atomic<long> active_io_zones_;
   std::atomic<long> open_io_zones_;
-  /* Protects zone_resuorces_  condition variable, used
+  /* Protects zone_resources_  condition variable, used
      for notifying changes in open_io_zones_ */
   std::mutex zone_resources_mtx_;
   std::condition_variable zone_resources_;
@@ -511,6 +517,7 @@ class ZonedBlockDevice {
   // (kqh): OccupySpace means the space that has been written, i.e. The space
   // between start space and write pointer of each zone
   uint64_t GetOccupySpace();
+  double GetPartitionGR();
 
   std::string GetFilename();
   uint32_t GetBlockSize();
