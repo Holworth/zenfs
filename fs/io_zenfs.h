@@ -128,6 +128,8 @@ class ZoneFile {
   // SST might be a flush SST or an output file of a GC task. This function
   // needs different dealing approach
   IOStatus ValueSSTAppend(char* data, uint32_t size);
+  IOStatus GetZoneForFlushValueSSTWrite(Zone** zone);
+  IOStatus GetZoneForGCValueSSTWrite(Zone** zone);
 
   // Get the corresponding partition according to current file type
   std::shared_ptr<ZonedBlockDevice::ZonePartition> GetPartition();
@@ -148,6 +150,24 @@ class ZoneFile {
   // ============================================================================
   uint64_t GetLevel() const;
   void SetLevel(uint64_t level);
+
+  // Extract the file number of this file via filename, return -1 if it's not
+  // suffixed with ".sst". 
+  uint64_t ExtractFileNumber() {
+    uint64_t fn = -1;
+
+    auto fname = GetFilename();
+    // Eliminate all preceding directories and only maintain the file number
+    auto idx = fname.find_last_of('/');
+    if (idx != fname.npos) {
+      // Index started from idx + 1 because we need to ignore the charater '/'
+      fname = fname.substr(idx + 1, fname.size() - idx - 1);
+      if (fname.find(".sst") != fname.npos) {
+        return std::stoull(fname.substr(0, fname.size() - strlen(".sst")));
+      }
+    }
+    return -1;
+  }
 
   PlacementFileType GetPlacementFileType() const;
   void SetPlacementFileType(PlacementFileType ftype);
@@ -199,9 +219,9 @@ class ZoneFile {
 
   // An approximation of the size of current file. For simplicity we use a hard
   // coding here. However, the reasonable approach is to read the exact size of
-  // value sst from the dboption. 
-  // The DBOptions set a limit for the blob file size, however, do all blob 
-  // files obey this limitation? 
+  // value sst from the dboption.
+  // The DBOptions set a limit for the blob file size, however, do all blob
+  // files obey this limitation?
   size_t ApproximateFileSize() { return (32 * 1024ULL * 1024ULL); }
 
   // ============================================================================

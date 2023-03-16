@@ -149,6 +149,7 @@ class ZenFS : public FileSystemWrapper {
   std::mutex metadata_sync_mtx_;
   std::unique_ptr<Superblock> superblock_;
 
+
   std::shared_ptr<Logger> GetLogger() { return logger_; }
 
   struct ZenFSMetadataWriter : public MetadataWriter {
@@ -216,7 +217,7 @@ class ZenFS : public FileSystemWrapper {
 
   void Dump() override;
 
-  std::pair<std::unordered_set<uint64_t>, GenericHotness> GetGCHintsFromFS(
+  std::pair<std::unordered_set<uint64_t>, HotnessType> GetGCHintsFromFS(
       void* out_args) override;
 
   void DumpZoneGCStats();
@@ -491,6 +492,8 @@ class ZenFS : public FileSystemWrapper {
 
   void UpdateTableProperties(const std::string& fname,
                              const TableProperties* tbl_prop) override;
+
+  void MaybeReleaseGCWriteZone(HotnessType type) override;
 
  public:
   using FileToExtents =

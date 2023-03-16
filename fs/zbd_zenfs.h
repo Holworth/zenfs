@@ -375,9 +375,11 @@ class ZonedBlockDevice {
                   ZonedBlockDevice *_zbd)
         : zones(_zones), activated_zone(kInvalidZoneId), zbd(_zbd) {}
 
-    // Getter and Setter for activate zone
+    // Getter and Setter 
     zone_id_t GetActivatedZone() const { return activated_zone; }
     void SetActivateZone(zone_id_t zone) { activated_zone = zone; }
+    zone_id_t GetCurrGCWriteZone() const { return curr_gc_write_zone; }
+    void SetCurrGCWriteZone(zone_id_t zone) { curr_gc_write_zone = zone; }
 
     // Manipulate interface for contained zones in this partition
     void AddZone(zone_id_t zone) {
@@ -390,6 +392,8 @@ class ZonedBlockDevice {
       zones.erase(zone);
     }
 
+    std::unordered_set<zone_id_t> GetZones() const { return zones; }
+
     // For Debug purpose
     std::string Dump() {
       std::stringstream ss;
@@ -401,6 +405,31 @@ class ZonedBlockDevice {
         ss << gc_stat->Dump() << "\n";
       }
       return ss.str();
+    }
+
+    // Finish curr_gc_write_zone and set curr_gc_write_zone to be invalid 
+    // Acquire: Current thread hold the lock of this zone 
+    IOStatus FinishCurrGCWriteZone() {
+      IOStatus s = IOStatus::OK();
+      if (curr_gc_write_zone == kInvalidZoneId) {
+        return s;
+      }
+      auto gc_write_zone = zbd->GetZone(curr_gc_write_zone);
+      bool full = gc_write_zone->IsFull();
+      zbd->GetZoneGCStatsOf(curr_gc_write_zone)->wasted_size +=
+          gc_write_zone->GetCapacityLeft();
+      // Finish this zone when it has no enough space
+      s = gc_write_zone->Finish();
+      if (!s.ok()) {
+        return s;
+      }
+      s = gc_write_zone->Close();
+      gc_write_zone->CheckRelease();
+      if (!s.ok()) {
+        return s;
+      }
+      curr_gc_write_zone = kInvalidZoneId;
+      return s;
     }
   };
 
@@ -455,6 +484,13 @@ class ZonedBlockDevice {
   std::shared_ptr<ZenFSMetrics> metrics_;
   std::shared_ptr<XZenFSMetrics> x_metrics_ = std::make_shared<XZenFSMetrics>();
 
+  // A map recording Blob SST (file number) stored in a specific zone
+  // NOTE: Initialized from persistent metadata. We place this struct in zbd
+  // instead of ZenFS since ZoneFile can directly access zbd.
+  // For simplicity we use an array to store this map and use zone id for
+  // indexing.
+  std::vector<uint64_t> zone_2_file_[300];
+
   void EncodeJsonZone(std::ostream &json_stream,
                       const std::vector<Zone *> zones);
 
@@ -467,6 +503,29 @@ class ZonedBlockDevice {
 
   IOStatus Open(bool readonly, bool exclusive);
   IOStatus CheckScheduler();
+
+  // Add a file number to zone
+  void AddFileToZone(uint64_t f, zone_id_t zone_id) {
+    auto& z = zone_2_file_[zone_id];
+    assert(std::find(z.begin(), z.end(), f) == z.end());
+    z.push_back(f);
+  }
+
+  // This interface should be invoked when a specific file is deleted.
+  void RemoveFileFromZone(uint64_t f, zone_id_t zone_id) {
+    auto& z = zone_2_file_[zone_id];
+    auto it = std::find(z.begin(), z.end(), f);
+    assert(it != z.end());
+    z.erase(it);
+  }
+
+  std::unordered_set<uint64_t> GetFilesOfZone(zone_id_t zone_id) {
+    std::unordered_set<uint64_t> ret;
+    for (const auto &fn : zone_2_file_[zone_id]) {
+      ret.insert(fn);
+    }
+    return ret;
+  }
 
   Zone *GetIOZone(uint64_t offset);
 
@@ -629,6 +688,22 @@ class ZonedBlockDevice {
   // of each partition needs to be persist and the implementation of this
   // initialization reads these persistent records
   void InitializePartitions();
+
+  // Pick one zone with highest garbage ratio in a specific partition. Return
+  // Invalid Zone id if no appropriate zone can be returned
+  std::pair<zone_id_t, double> PickZoneWithHighestGarbageRatio(
+      const ZonePartition *partition);
+  std::pair<zone_id_t, double> PickZoneFromHotPartition() {
+    return PickZoneWithHighestGarbageRatio(hot_partition_.get());
+  }
+  std::pair<zone_id_t, double> PickZoneFromWarmPartition() {
+    return PickZoneWithHighestGarbageRatio(warm_partition_.get());
+  }
+
+  std::pair<zone_id_t, double> PickZoneFromHashPartition(
+      uint32_t *partition_id);
+
+  std::unordered_set<uint64_t> GetFilesFromZone(zone_id_t zone_id);
 
   // ===========================================================
   // =========== Bytedance Project Development (END) ==================

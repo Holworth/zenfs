@@ -477,12 +477,50 @@ void ZonedBlockDevice::InitializeZoneGCStats() {
 
 void ZonedBlockDevice::InitializePartitions() {
   // TODO: Initialize Hot/Warm partition
+  hot_partition_ =
+      std::make_shared<HotPartition>(std::unordered_set<zone_id_t>(), this);
+  warm_partition_ =
+      std::make_shared<HotPartition>(std::unordered_set<zone_id_t>(), this);
+
   // Initialize each partition assuming the device is in a bare state.
   for (uint32_t i = 0; i < partition_num; ++i) {
     hash_partitions_[i] =
         std::make_shared<HashPartition>(std::unordered_set<zone_id_t>(), this);
     hash_partitions_[i]->SetActivateZone(kInvalidZoneId);
   }
+}
+
+std::pair<zone_id_t, double> ZonedBlockDevice::PickZoneWithHighestGarbageRatio(
+    const ZonePartition *partition) {
+  zone_id_t ret_zone = kInvalidZoneId;
+  double max_gr = 0.00;
+  for (const auto &zone_id : partition->GetZones()) {
+    auto zone = GetZone(zone_id);
+    if (!zone->IsFull()) {
+      continue;
+    }
+    double gr = GetZoneGCStatsOf(zone_id)->GarbageRatio();
+    if (GetZoneGCStatsOf(zone_id)->GarbageRatio() > max_gr) {
+      max_gr = gr;
+      ret_zone = zone_id;
+    }
+  }
+  return {ret_zone, max_gr};
+}
+
+std::pair<zone_id_t, double> ZonedBlockDevice::PickZoneFromHashPartition(
+    uint32_t *partition_id) {
+  zone_id_t ret_zone = kInvalidZoneId;
+  double max_gr = 0.00;
+  for (uint64_t i = 0; i < partition_num; ++i) {
+    auto [id, gr] = PickZoneWithHighestGarbageRatio(hash_partitions_[i].get());
+    if (gr > max_gr) {
+      max_gr = gr;
+      ret_zone = id;
+      *partition_id = i;
+    }
+  }
+  return {ret_zone, max_gr};
 }
 
 void ZonedBlockDevice::InitEmptyZoneQueue() {
@@ -558,7 +596,7 @@ uint64_t ZonedBlockDevice::GetOccupySpace() {
 
 double ZonedBlockDevice::GetPartitionGR() {
   uint64_t total_kv = 1, valid_kv = 1;
-  for (const auto& zone_id : hash_partitions_[0]->zones) {
+  for (const auto &zone_id : hash_partitions_[0]->zones) {
     auto gc_stat = GetZoneGCStatsOf(zone_id);
     total_kv += gc_stat->no_kv;
     valid_kv += gc_stat->no_valid_kv;

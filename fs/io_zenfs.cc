@@ -310,6 +310,14 @@ ZoneFile::~ZoneFile() {
   if (!s.ok()) {
     zbd_->SetZoneDeferredStatus(s);
   }
+  // Note that the file number are added to zone-file map only when it is a
+  // value sst
+  if (belonged_zone_ && IsValueSST()) {
+    auto fn = ExtractFileNumber();
+    if (fn != -1) {
+      zbd_->RemoveFileFromZone(fn, belonged_zone_->ZoneId());
+    }
+  }
 }
 
 void ZoneFile::ClearExtents() {
@@ -347,12 +355,14 @@ IOStatus ZoneFile::CloseActiveZone() {
     if (!s.ok()) {
       return s;
     }
-    // (kqh): For value sst, there is no need to return active or open token
-    // on file close. Each partition (Hot/Warm/Partition) occupies an active and
-    // open zone for the whole time
-    if (IsValueSST()) {
+
+    if (IsValueSST() && !IsGCOutputValueSST()) {
+      // (kqh): For flush value sst, there is no need to return active or open
+      // token on file close. Each partition (Hot/Warm/Partition) occupies an
+      // active and open zone token for the whole time
       return s;
     }
+
     zbd_->PutOpenIOZoneToken();
     if (IsWAL()) {
       zbd_->wal_zone_open_count_--;
@@ -798,6 +808,135 @@ IOStatus ZoneFile::SparseAppend(char* sparse_buffer, uint32_t data_size) {
   return IOStatus::OK();
 }
 
+IOStatus ZoneFile::GetZoneForFlushValueSSTWrite(Zone** write_zone) {
+  assert(!IsGCOutputValueSST());
+  IOStatus s = IOStatus::OK();
+
+  // Pick one zone to write according to its placement file type
+  auto partition = GetPartition();
+  bool need_new_zone = false;
+  auto zone_id = partition->GetActivatedZone();
+  auto prev_zone = zbd_->GetZone(zone_id);
+  // This partition has no activated zone yet
+  if (prev_zone == nullptr) {
+    need_new_zone = true;
+  } else {
+    prev_zone->LoopForAcquire();
+    // This approximation might not be accurate. For BufferedAppend, there
+    // might be some extra space for padding.
+    if (prev_zone->GetCapacityLeft() < ApproximateFileSize()) {
+      need_new_zone = true;
+    }
+  }
+
+  // Use the previous activate zone for write
+  if (!need_new_zone) {
+    *write_zone = prev_zone;
+    return s;
+  }
+  // Release the prev zone if it's not nullptr
+  // We do not need to release active and open token since it can be
+  // reused for next chosen activate zone
+  if (prev_zone) {
+    bool full = prev_zone->IsFull();
+    zbd_->GetZoneGCStatsOf(zone_id)->wasted_size +=
+        prev_zone->GetCapacityLeft();
+    // Finish this zone when it has no enough space
+    s = prev_zone->Finish();
+    if (!s.ok()) {
+      return s;
+    }
+    s = prev_zone->Close();
+    prev_zone->CheckRelease();
+    if (!s.ok()) {
+      return s;
+    }
+  } else {
+    // No activate zone yet, ask for active and open token
+    while (!zbd_->GetActiveIOZoneTokenIfAvailable())
+      ;
+    zbd_->WaitForOpenIOZoneToken(true);
+  }
+  auto new_zone_id = zbd_->PopEmptyZone();
+  if (new_zone_id == kInvalidZoneId) {
+    return IOStatus::NoSpace("ValueSST acquire empty zone Failed");
+  }
+
+  auto new_zone = zbd_->GetZone(new_zone_id);
+  partition->AddZone(new_zone_id);
+  partition->SetActivateZone(new_zone_id);
+
+  if (prev_zone) {
+    ZnsLog(kCyan,
+           "Partition(%d) Switch ActivateZone From Zone%lu(%lu MiB) to "
+           "Zone%lu(%lu MiB)",
+           place_ftype_.PartitionId(), zone_id,
+           ToMiB(prev_zone->GetCapacityLeft()), new_zone_id,
+           ToMiB(new_zone->GetCapacityLeft()));
+  }
+
+  new_zone->LoopForAcquire();
+  *write_zone = new_zone;
+
+  return s;
+}
+
+IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
+  assert(IsGCOutputValueSST());
+  auto partition = GetPartition();
+  auto zone_id = partition->GetCurrGCWriteZone();
+  auto gc_write_zone = zbd_->GetZone(zone_id);
+  bool need_new_zone = false;
+  IOStatus s = IOStatus::OK();
+
+  if (gc_write_zone) {
+    gc_write_zone->LoopForAcquire();
+    if (gc_write_zone->GetCapacityLeft() < ApproximateFileSize()) {
+      need_new_zone = true;
+      //
+      // FinishCurrGCWriteZone does not release the Open/Active token
+      // occupied by this gc_write_zone. The token will be released
+      // when the db layer notifies the FS to check if the current gc
+      // write zone can be finished at the end of one GC task.
+      //
+      // We do not need to return the active/open token here because
+      // a new gc_write_zone is allocated for subsequent writing
+      //
+      s = partition->FinishCurrGCWriteZone();
+      if (!s.ok()) {
+        return s;
+      }
+      partition->AddZone(gc_write_zone->ZoneId());
+    }
+  } else {
+    // If current partition has no GC write zone, we must allocate 
+    // one active and open token for the gc_write_zone of this partition. 
+    // These tokens remain valid until gc_write_zone is finished.
+    need_new_zone = true;
+    while (!zbd_->GetActiveIOZoneTokenIfAvailable())
+      ;
+    zbd_->WaitForOpenIOZoneToken(false);
+  }
+
+  if (!need_new_zone) {
+    *write_zone = gc_write_zone;
+    return s;
+  }
+
+  auto new_zone_id = zbd_->PopEmptyZone();
+  if (new_zone_id == kInvalidZoneId) {
+    return IOStatus::NoSpace("ValueSST acquire empty zone Failed");
+  }
+
+  auto new_zone = zbd_->GetZone(new_zone_id);
+  new_zone->LoopForAcquire();
+
+  partition->SetCurrGCWriteZone(new_zone_id);
+  *write_zone = new_zone;
+
+  return s;
+}
+
 IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
   assert(IsValueSST());
 
@@ -806,9 +945,6 @@ IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
   IOStatus s = IOStatus::OK();
 
   if (!active_zone_) {
-    // Pick one zone to write according to its placement file type
-    auto partition = GetPartition();
-
     //
     // Pick a zone for writing accordingly:
     //
@@ -816,79 +952,23 @@ IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
     //     switch the activated zone if necessary (i.e. no enough space to
     //     write).
     //
-    //   * For GC output sst, find a bunch of new zones to write.
+    //   * For GC output sst, just pick current gc_write_zone and switch 
+    //     the gc_write_zone if necessary.
     //
-    // In most case, there is only one thread writing flush SST or GC SST
+    // In most cases, there is only one thread writing flush SST or GC SST
     // for each partition.
     //
-
     Zone* write_zone = nullptr;
     if (!IsGCOutputValueSST()) {
-      bool need_new_zone = false;
-      auto zone_id = partition->GetActivatedZone();
-      auto prev_zone = zbd_->GetZone(zone_id);
-      // This partition has no activated zone yet
-      if (prev_zone == nullptr) {
-        need_new_zone = true;
-      } else {
-        prev_zone->LoopForAcquire();
-        // This approximation might not be accurate. For BufferedAppend, there
-        // might be some extra space for padding.
-        if (prev_zone->GetCapacityLeft() < ApproximateFileSize()) {
-          need_new_zone = true;
-        }
-      }
-
-      // Use the previous activate zone for write
-      if (!need_new_zone) {
-        write_zone = prev_zone;
-      } else {
-        // Release the prev zone if it's not nullptr
-        // We do not need to release active and open token since it can be
-        // reused for next chosen activate zone
-        if (prev_zone) {
-          bool full = prev_zone->IsFull();
-          zbd_->GetZoneGCStatsOf(zone_id)->wasted_size +=
-              prev_zone->GetCapacityLeft();
-          // Finish this zone when it has no enough space
-          s = prev_zone->Finish();
-          if (!s.ok()) {
-            return s;
-          }
-          s = prev_zone->Close();
-          prev_zone->CheckRelease();
-          if (!s.ok()) {
-            return s;
-          }
-        } else {
-          // No activate zone yet, ask for active and open token
-          while (!zbd_->GetActiveIOZoneTokenIfAvailable())
-            ;
-          zbd_->WaitForOpenIOZoneToken(true);
-        }
-        auto new_zone_id = zbd_->PopEmptyZone();
-        if (new_zone_id == kInvalidZoneId) {
-          return IOStatus::NoSpace("ValueSST acquire empty zone Failed");
-        }
-
-        auto new_zone = zbd_->GetZone(new_zone_id);
-        partition->AddZone(new_zone_id);
-        partition->SetActivateZone(new_zone_id);
-
-        if (prev_zone) {
-          ZnsLog(kCyan,
-                 "Partition(%d) Switch ActivateZone From Zone%lu(%lu MiB) to "
-                 "Zone%lu(%lu MiB)",
-                 place_ftype_.PartitionId(), zone_id,
-                 ToMiB(prev_zone->GetCapacityLeft()), new_zone_id,
-                 ToMiB(new_zone->GetCapacityLeft()));
-        }
-
-        new_zone->LoopForAcquire();
-        write_zone = new_zone;
+      s = GetZoneForFlushValueSSTWrite(&write_zone);
+      if (!s.ok()) {
+        return s;
       }
     } else {
-      // TODO: Dealing with the case of GC file
+      s = GetZoneForGCValueSSTWrite(&write_zone);
+      if (!s.ok()) {
+        return s;
+      }
     }
     // Set all related meta data
     SetActiveZone(write_zone);
@@ -901,8 +981,8 @@ IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
 
   // This implementation causes this file occupy this zone exclusively. In our
   // design, we expect there is only one thread flushing the memtable. Multiple
-  // threads flushing the memtable would require assign zone for each flush
-  // thread.
+  // threads flushing the memtable would require assigning individual zones 
+  // apiece.
   while (left) {
     // NOTE: We do not allow switching zone cause we require the value sst to
     // be completely written in a single zone
@@ -1208,6 +1288,13 @@ void ZoneFile::SetActiveZone(Zone* zone) {
 void ZoneFile::SetBelongedZone(Zone* zone) {
   assert(zone->IsBusy());
   belonged_zone_ = zone;
+  if (IsValueSST()) {
+    // Only add file number of a value sst to the zone-file map when
+    // it is a value sst
+    auto fn = ExtractFileNumber();
+    assert(fn != -1);
+    zbd_->AddFileToZone(fn, belonged_zone_->ZoneId());
+  }
 }
 
 ZenFSMetricsHistograms ZoneFile::GetReportType() const {
