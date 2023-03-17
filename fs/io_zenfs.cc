@@ -817,6 +817,9 @@ IOStatus ZoneFile::GetZoneForFlushValueSSTWrite(Zone** write_zone) {
   bool need_new_zone = false;
   auto zone_id = partition->GetActivatedZone();
   auto prev_zone = zbd_->GetZone(zone_id);
+
+  partition->MaybeResetPendingZones();
+
   // This partition has no activated zone yet
   if (prev_zone == nullptr) {
     need_new_zone = true;
@@ -888,6 +891,8 @@ IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
   auto gc_write_zone = zbd_->GetZone(zone_id);
   bool need_new_zone = false;
   IOStatus s = IOStatus::OK();
+
+  partition->MaybeResetPendingZones();
 
   if (gc_write_zone) {
     gc_write_zone->LoopForAcquire();
@@ -1019,7 +1024,7 @@ std::shared_ptr<ZonedBlockDevice::ZonePartition> ZoneFile::GetPartition() {
     return zbd_->hot_partition_;
   } else if (place_ftype_.IsWarm()) {
     return zbd_->hot_partition_;
-  } else if (place_ftype_.IsParition()) {
+  } else if (place_ftype_.IsPartition()) {
     return zbd_->hash_partitions_[place_ftype_.PartitionId()];
   } else {
     return nullptr;

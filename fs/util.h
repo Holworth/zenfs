@@ -1,7 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <deque>
+#include <mutex>
 #include <set>
+#include <thread>
 
 //
 // This iterator provides the functionality of enumerating all possible

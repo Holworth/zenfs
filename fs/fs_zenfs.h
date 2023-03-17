@@ -44,6 +44,8 @@ class ZoneFileSnapshot;
 class ZenFSSnapshot;
 class ZenFSSnapshotOptions;
 
+// A brief stats of zone used for garbage collection
+
 class Superblock {
   uint32_t magic_ = 0;
   char uuid_[37] = {0};
@@ -219,6 +221,10 @@ class ZenFS : public FileSystemWrapper {
 
   std::pair<std::unordered_set<uint64_t>, HotnessType> GetGCHintsFromFS(
       void* out_args) override;
+
+  std::shared_ptr<Env::FSGCHints> GetFSGCHints() override;
+  
+  void NotifyGarbageCollectionFinish(const Compaction* c) override;
 
   void DumpZoneGCStats();
 

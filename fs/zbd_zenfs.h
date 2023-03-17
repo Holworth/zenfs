@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -371,15 +372,31 @@ class ZonedBlockDevice {
     //
     zone_id_t curr_gc_write_zone;
 
+    //
+    // A zone used for garbage collection can not be reset immediately after
+    // garbage collection is done successfully. There might be multiple readers
+    // reference files located in this zone.
+    //
+    // We use a pending queue to delay the actual reset operation of logically
+    // reclaimed zones until all files in this zone has been deleted.
+    //
+    std::deque<zone_id_t> pending_reset_zones;
+    std::mutex pending_reset_zone_mtx;  // For concurrent control
+
     ZonePartition(const std::unordered_set<zone_id_t> &_zones,
                   ZonedBlockDevice *_zbd)
         : zones(_zones), activated_zone(kInvalidZoneId), zbd(_zbd) {}
 
-    // Getter and Setter 
+    // Getter and Setter
     zone_id_t GetActivatedZone() const { return activated_zone; }
     void SetActivateZone(zone_id_t zone) { activated_zone = zone; }
     zone_id_t GetCurrGCWriteZone() const { return curr_gc_write_zone; }
     void SetCurrGCWriteZone(zone_id_t zone) { curr_gc_write_zone = zone; }
+
+    void AddPendingResetZone(zone_id_t zone) {
+      std::scoped_lock<std::mutex> lck(pending_reset_zone_mtx);
+      pending_reset_zones.push_back(zone);
+    }
 
     // Manipulate interface for contained zones in this partition
     void AddZone(zone_id_t zone) {
@@ -394,6 +411,34 @@ class ZonedBlockDevice {
 
     std::unordered_set<zone_id_t> GetZones() const { return zones; }
 
+    void MaybeResetPendingZones() {
+      std::scoped_lock<std::mutex> lck(pending_reset_zone_mtx);
+      auto reset_zone = [&](uint64_t z_id) -> bool {
+        auto zone = zbd->GetZone(z_id);
+        assert(zone->IsFull());
+        zone->LoopForAcquire();
+        if (zone->used_capacity_ == 0) {
+          // If Reset() fails, keeping checking this zone during
+          // next round.
+          auto s = zone->Reset();
+          zone->CheckRelease();
+          if (!s.ok()) {
+            return false;
+          }
+          ZnsLog(kCyan, "Partition() MaybeResetPendingZone: Zone%lu is reset",
+                 zone->ZoneId());
+          zbd->PushEmptyZone(z_id);
+          return true;
+        }
+        zone->CheckRelease();
+        return false;
+      };
+      // Note that remove_if does not do the actual element erase operation
+      auto iter = std::remove_if(pending_reset_zones.begin(),
+                                 pending_reset_zones.end(), reset_zone);
+      pending_reset_zones.erase(iter, pending_reset_zones.end());
+    }
+
     // For Debug purpose
     std::string Dump() {
       std::stringstream ss;
@@ -407,8 +452,8 @@ class ZonedBlockDevice {
       return ss.str();
     }
 
-    // Finish curr_gc_write_zone and set curr_gc_write_zone to be invalid 
-    // Acquire: Current thread hold the lock of this zone 
+    // Finish curr_gc_write_zone and set curr_gc_write_zone to be invalid
+    // Acquire: Current thread hold the lock of this zone
     IOStatus FinishCurrGCWriteZone() {
       IOStatus s = IOStatus::OK();
       if (curr_gc_write_zone == kInvalidZoneId) {
@@ -506,14 +551,14 @@ class ZonedBlockDevice {
 
   // Add a file number to zone
   void AddFileToZone(uint64_t f, zone_id_t zone_id) {
-    auto& z = zone_2_file_[zone_id];
+    auto &z = zone_2_file_[zone_id];
     assert(std::find(z.begin(), z.end(), f) == z.end());
     z.push_back(f);
   }
 
   // This interface should be invoked when a specific file is deleted.
   void RemoveFileFromZone(uint64_t f, zone_id_t zone_id) {
-    auto& z = zone_2_file_[zone_id];
+    auto &z = zone_2_file_[zone_id];
     auto it = std::find(z.begin(), z.end(), f);
     assert(it != z.end());
     z.erase(it);
@@ -523,6 +568,14 @@ class ZonedBlockDevice {
     std::unordered_set<uint64_t> ret;
     for (const auto &fn : zone_2_file_[zone_id]) {
       ret.insert(fn);
+    }
+    return ret;
+  }
+
+  std::vector<uint64_t> GetFilesOfZoneAsVec(zone_id_t zone_id) {
+    std::vector<uint64_t> ret;
+    for (const auto &fn : zone_2_file_[zone_id]) {
+      ret.emplace_back(fn);
     }
     return ret;
   }
@@ -665,6 +718,18 @@ class ZonedBlockDevice {
 
   // Get the zone struct using according zone id.
   Zone *GetZone(zone_id_t zone_id);
+
+  // Get the proper partition
+  std::shared_ptr<ZonePartition> GetPartition(HotnessType type) {
+    if (type.IsHot())
+      return hot_partition_;
+    else if (type.IsWarm())
+      return warm_partition_;
+    else if (type.IsPartition())
+      return hash_partitions_[type.PartitionId()];
+    else
+      return nullptr;
+  }
 
   void InitializeZoneGCStats();
 

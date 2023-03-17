@@ -5,6 +5,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <libzbd/zbd.h>
+
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -1344,16 +1345,15 @@ void ZenFS::Dump() {
 // the out_args is used to store a uint64_t partition ID
 std::pair<std::unordered_set<uint64_t>, HotnessType> ZenFS::GetGCHintsFromFS(
     void* out_args) {
-  
-  // This is a parameter that controls if the GC runs aggresively. For 
-  // partition zone, if its garbage ratio is less than this threshold, 
+  // This is a parameter that controls if the GC runs aggresively. For
+  // partition zone, if its garbage ratio is less than this threshold,
   // it will not be used for GC.
   const double kPartitionZoneGCThreshold = 0.4;
 
-  // (ZNS DEBUG): Limit the number of returning valid Zone Id for debugging 
+  // (ZNS DEBUG): Limit the number of returning valid Zone Id for debugging
   // purpose
   static int get_gc_hints_time = 0;
-  
+
   auto pick_res = zbd_->PickZoneFromHotPartition();
   HotnessType hotness = HotnessType::Hot();
 
@@ -1371,7 +1371,7 @@ std::pair<std::unordered_set<uint64_t>, HotnessType> ZenFS::GetGCHintsFromFS(
     }
 
     // TODO: Maybe add some limitations here, for example, if the garbage ratio
-    // is less than a specific threshold, do not garbage collect it. 
+    // is less than a specific threshold, do not garbage collect it.
   }
 
   if (pick_res.first == kInvalidZoneId) {
@@ -1387,6 +1387,97 @@ std::pair<std::unordered_set<uint64_t>, HotnessType> ZenFS::GetGCHintsFromFS(
   ZnsLog(kCyan, "[ZenFS::GetGCHintsFromFS]: Pick Zone %lu, GR: %.2lf",
          pick_res.first, pick_res.second);
   return {zbd_->GetFilesOfZone(pick_res.first), hotness};
+}
+
+std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
+  // This is a parameter that controls if the GC runs aggresively. For
+  // partition zone, if its garbage ratio is less than this threshold,
+  // it will not be used for GC.
+  const double kPartitionZoneGCThreshold = 0.4;
+
+  // (ZNS DEBUG): Limit the number of returning valid Zone Id for debugging
+  // purpose
+  static int get_gc_hints_time = 0;
+
+  auto pick_res = zbd_->PickZoneFromHotPartition();
+  HotnessType hotness = HotnessType::Hot();
+
+  if (pick_res.first == kInvalidZoneId) {
+    pick_res = zbd_->PickZoneFromWarmPartition();
+    hotness = HotnessType::Warm();
+  }
+
+  if (pick_res.first == kInvalidZoneId) {
+    uint32_t p_id = -1;
+    pick_res = zbd_->PickZoneFromHashPartition(&p_id);
+    hotness = HotnessType::Partition(p_id);
+    if (pick_res.second < kPartitionZoneGCThreshold) {
+      pick_res.first = kInvalidZoneId;
+    }
+
+    // TODO: Maybe add some limitations here, for example, if the garbage ratio
+    // is less than a specific threshold, do not garbage collect it.
+  }
+
+  if (pick_res.first == kInvalidZoneId) {
+    return nullptr;
+  }
+
+  // If it already returns a valid gc hints, do not return the next one
+  if (get_gc_hints_time >= 1) {
+    return nullptr;
+  }
+
+  ++get_gc_hints_time;
+  ZnsLog(kCyan, "[ZenFS::GetFSGCHints]: Pick Zone %lu, GR: %.2lf",
+         pick_res.first, pick_res.second);
+
+  // Construct the returned GC hints
+  auto ret = std::make_shared<Env::FSGCHints>();
+  ret->type = hotness;
+
+  Env::GCInputZone input_zone;
+  input_zone.zone_id = pick_res.first;
+  input_zone.file_numbers = zbd_->GetFilesOfZoneAsVec(pick_res.first);
+
+  ret->type = hotness;
+  ret->input_zones.emplace_back(std::move(input_zone));
+
+  return ret;
+}
+
+void ZenFS::NotifyGarbageCollectionFinish(const Compaction* c) {
+  if (!c) {
+    return;
+  }
+  auto p = zbd_->GetPartition(c->hotness_type());
+  for (const auto& z_id : c->gc_input_zones()) {
+    // Release this zone if it's already empty
+    auto z = zbd_->GetZone(z_id);
+    assert(z->IsFull());
+
+    // Remove this zone from this partition temporarily
+    p->RemoveZone(z_id);
+
+    // Actually there is no need to acuqire the lock of this zone
+    // since it is full: No write can access this zone and read
+    // does not need to acquire lock of this zone
+    z->LoopForAcquire();
+    if (z->used_capacity_ == 0) {
+      auto s = z->Reset();
+      if (s.ok()) {
+        // This zone will be reused
+        zbd_->PushEmptyZone(z_id);
+        ZnsLog(kCyan, "NotifyGarbageCollectionFinish: Zone%lu is reset",
+               z->ZoneId());
+      } else {
+        p->AddPendingResetZone(z_id);
+      }
+    } else {
+      p->AddPendingResetZone(z_id);
+    }
+    z->CheckRelease();
+  }
 }
 
 void ZenFS::DumpZoneGCStats() {
@@ -2177,7 +2268,7 @@ void ZenFS::MaybeReleaseGCWriteZone(HotnessType type) {
     p = zbd_->hot_partition_;
   } else if (type.IsWarm()) {
     p = zbd_->warm_partition_;
-  } else if (type.IsParition()) {
+  } else if (type.IsPartition()) {
     p = zbd_->hash_partitions_[type.PartitionId()];
   } else {
     assert(false);
@@ -2188,7 +2279,7 @@ void ZenFS::MaybeReleaseGCWriteZone(HotnessType type) {
   zone->LoopForAcquire();
 
   // If current zone has no enough space,  finish it and release all acquired
-  // token of this zone. 
+  // token of this zone.
   if (zone->GetCapacityLeft() < zbd_->GetZoneSize() * 0.05) {
     auto s = p->FinishCurrGCWriteZone();
     if (!s.ok()) {
