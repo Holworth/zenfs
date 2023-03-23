@@ -356,7 +356,7 @@ class ZonedBlockDevice {
   // This struct should be implemented as thread-safe structs
   struct ZonePartition {
     std::unordered_set<zone_id_t> zones;
-    zone_id_t activated_zone;
+    zone_id_t activated_zone = kInvalidZoneId;
     ZonedBlockDevice *zbd;
 
     //
@@ -370,7 +370,7 @@ class ZonedBlockDevice {
     // open token. We consider reusing the activated_zone in the presence of
     // tokens' inadequacy.
     //
-    zone_id_t curr_gc_write_zone;
+    zone_id_t curr_gc_write_zone = kInvalidZoneId;
 
     //
     // A zone used for garbage collection can not be reset immediately after
