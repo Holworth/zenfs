@@ -204,8 +204,10 @@ class Zone {
   }
 
   void LoopForAcquire() {
+    // ZnsLog(kCyan, "Zone(%lu) LoopForAcquire::Start", ZoneId());
     while (!Acquire())
       ;
+    // ZnsLog(kCyan, "Zone(%lu) LoopForAcquire::End", ZoneId());
   }
 
   void SetProvisioningFlag(bool flag) { provisioning_zone_ = flag; }
@@ -412,6 +414,7 @@ class ZonedBlockDevice {
     std::unordered_set<zone_id_t> GetZones() const { return zones; }
 
     void MaybeResetPendingZones() {
+      // ZnsLog(kCyan, "MaybeResetPendingZones: Start");
       std::scoped_lock<std::mutex> lck(pending_reset_zone_mtx);
       auto reset_zone = [&](uint64_t z_id) -> bool {
         auto zone = zbd->GetZone(z_id);

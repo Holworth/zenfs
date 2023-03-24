@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 
+#include "fs/fs_zenfs.h"
 #include "fs/log.h"
 #include "fs/metrics.h"
 #include "fs/zbd_zenfs.h"
@@ -914,8 +915,8 @@ IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
       partition->AddZone(gc_write_zone->ZoneId());
     }
   } else {
-    // If current partition has no GC write zone, we must allocate 
-    // one active and open token for the gc_write_zone of this partition. 
+    // If current partition has no GC write zone, we must allocate
+    // one active and open token for the gc_write_zone of this partition.
     // These tokens remain valid until gc_write_zone is finished.
     need_new_zone = true;
     while (!zbd_->GetActiveIOZoneTokenIfAvailable())
@@ -944,6 +945,8 @@ IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
 
 IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
   assert(IsValueSST());
+  // ZnsLog(kCyan, "ValueSSTAppend::Start");
+  // Defer d([]() { ZnsLog(kCyan, "ValueSSTAppend::End"); });
 
   uint32_t left = data_size;
   uint32_t wr_size, offset = 0;
@@ -957,7 +960,7 @@ IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
     //     switch the activated zone if necessary (i.e. no enough space to
     //     write).
     //
-    //   * For GC output sst, just pick current gc_write_zone and switch 
+    //   * For GC output sst, just pick current gc_write_zone and switch
     //     the gc_write_zone if necessary.
     //
     // In most cases, there is only one thread writing flush SST or GC SST
@@ -986,7 +989,7 @@ IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
 
   // This implementation causes this file occupy this zone exclusively. In our
   // design, we expect there is only one thread flushing the memtable. Multiple
-  // threads flushing the memtable would require assigning individual zones 
+  // threads flushing the memtable would require assigning individual zones
   // apiece.
   while (left) {
     // NOTE: We do not allow switching zone cause we require the value sst to
@@ -1023,7 +1026,7 @@ std::shared_ptr<ZonedBlockDevice::ZonePartition> ZoneFile::GetPartition() {
   if (place_ftype_.IsHot()) {
     return zbd_->hot_partition_;
   } else if (place_ftype_.IsWarm()) {
-    return zbd_->hot_partition_;
+    return zbd_->warm_partition_;
   } else if (place_ftype_.IsPartition()) {
     return zbd_->hash_partitions_[place_ftype_.PartitionId()];
   } else {

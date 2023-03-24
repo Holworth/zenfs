@@ -1491,6 +1491,14 @@ void ZenFS::DumpZoneGCStats() {
     of << "\n";
   }
 
+  of << "[Partition Hot]\n";
+  of << zbd_->hot_partition_->Dump();
+  of << "\n";
+
+  of << "[Partition Warm]\n";
+  of << zbd_->warm_partition_->Dump();
+  of << "\n";
+
   of.close();
 }
 
