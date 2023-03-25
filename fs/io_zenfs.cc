@@ -357,7 +357,7 @@ IOStatus ZoneFile::CloseActiveZone() {
       return s;
     }
 
-    if (IsValueSST() && !IsGCOutputValueSST()) {
+    if (IsValueSST()) {
       // (kqh): For flush value sst, there is no need to return active or open
       // token on file close. Each partition (Hot/Warm/Partition) occupies an
       // active and open zone token for the whole time
@@ -913,6 +913,7 @@ IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
         return s;
       }
       partition->AddZone(gc_write_zone->ZoneId());
+      ZnsLog(kCyan, "Partition switch GC Zone");
     }
   } else {
     // If current partition has no GC write zone, we must allocate
@@ -945,8 +946,11 @@ IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
 
 IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
   assert(IsValueSST());
-  // ZnsLog(kCyan, "ValueSSTAppend::Start");
-  // Defer d([]() { ZnsLog(kCyan, "ValueSSTAppend::End"); });
+  ZnsLog(kCyan, "ValueSSTAppend::Start (IsGC: %lu)", IsGCOutputValueSST());
+  Defer d([=]() {
+    ZnsLog(kCyan, "ValueSSTAppend::End (IsGC: %lu)",
+           this->IsGCOutputValueSST());
+  });
 
   uint32_t left = data_size;
   uint32_t wr_size, offset = 0;

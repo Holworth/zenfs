@@ -511,16 +511,37 @@ std::pair<zone_id_t, double> ZonedBlockDevice::PickZoneWithHighestGarbageRatio(
 std::pair<zone_id_t, double> ZonedBlockDevice::PickZoneFromHashPartition(
     uint32_t *partition_id) {
   zone_id_t ret_zone = kInvalidZoneId;
-  double max_gr = 0.00;
+
+  // First check if there exists some partition that contains an active GC
+  // zone. If there is, use this partition preferably to save active token:
+  uint64_t partition_with_active_token = -1;
   for (uint64_t i = 0; i < partition_num; ++i) {
-    auto [id, gr] = PickZoneWithHighestGarbageRatio(hash_partitions_[i].get());
-    if (gr > max_gr) {
-      max_gr = gr;
-      ret_zone = id;
-      *partition_id = i;
+    if (hash_partitions_[i]->curr_gc_write_zone != kInvalidZoneId) {
+      partition_with_active_token = i;
     }
   }
-  return {ret_zone, max_gr};
+
+  if (partition_with_active_token != -1) {
+    // There is a partition that holds a token for its garbage collection
+    // zone. We check if there is a zone can garbage collected
+    assert(partition_with_active_token < partition_num);
+    auto [id, gr] = PickZoneWithHighestGarbageRatio(
+        hash_partitions_[partition_with_active_token].get());
+    *partition_id = partition_with_active_token;
+    return {id, gr};
+  } else {
+    double max_gr = 0.00;
+    for (uint64_t i = 0; i < partition_num; ++i) {
+      auto [id, gr] =
+          PickZoneWithHighestGarbageRatio(hash_partitions_[i].get());
+      if (gr > max_gr) {
+        max_gr = gr;
+        ret_zone = id;
+        *partition_id = i;
+      }
+    }
+    return {ret_zone, max_gr};
+  }
 }
 
 void ZonedBlockDevice::InitEmptyZoneQueue() {

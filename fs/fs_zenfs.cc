@@ -1345,48 +1345,7 @@ void ZenFS::Dump() {
 // the out_args is used to store a uint64_t partition ID
 std::pair<std::unordered_set<uint64_t>, HotnessType> ZenFS::GetGCHintsFromFS(
     void* out_args) {
-  // This is a parameter that controls if the GC runs aggresively. For
-  // partition zone, if its garbage ratio is less than this threshold,
-  // it will not be used for GC.
-  const double kPartitionZoneGCThreshold = 0.4;
-
-  // (ZNS DEBUG): Limit the number of returning valid Zone Id for debugging
-  // purpose
-  static int get_gc_hints_time = 0;
-
-  auto pick_res = zbd_->PickZoneFromHotPartition();
-  HotnessType hotness = HotnessType::Hot();
-
-  if (pick_res.first == kInvalidZoneId) {
-    pick_res = zbd_->PickZoneFromWarmPartition();
-    hotness = HotnessType::Warm();
-  }
-
-  if (pick_res.first == kInvalidZoneId) {
-    uint32_t p_id = -1;
-    pick_res = zbd_->PickZoneFromHashPartition(&p_id);
-    hotness = HotnessType::Partition(p_id);
-    if (pick_res.second < kPartitionZoneGCThreshold) {
-      pick_res.first = kInvalidZoneId;
-    }
-
-    // TODO: Maybe add some limitations here, for example, if the garbage ratio
-    // is less than a specific threshold, do not garbage collect it.
-  }
-
-  if (pick_res.first == kInvalidZoneId) {
-    return {{}, HotnessType::NoType()};
-  }
-
-  // If it already returns a valid gc hints, do not return the next one
-  if (get_gc_hints_time >= 1) {
-    return {{}, HotnessType::NoType()};
-  }
-
-  ++get_gc_hints_time;
-  ZnsLog(kCyan, "[ZenFS::GetGCHintsFromFS]: Pick Zone %lu, GR: %.2lf",
-         pick_res.first, pick_res.second);
-  return {zbd_->GetFilesOfZone(pick_res.first), hotness};
+  return {{}, HotnessType::NoType()};
 }
 
 std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
@@ -1411,12 +1370,11 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
     uint32_t p_id = -1;
     pick_res = zbd_->PickZoneFromHashPartition(&p_id);
     hotness = HotnessType::Partition(p_id);
+    // TODO: Maybe add some limitations here, for example, if the garbage ratio
+    // is less than a specific threshold, do not garbage collect it.
     if (pick_res.second < kPartitionZoneGCThreshold) {
       pick_res.first = kInvalidZoneId;
     }
-
-    // TODO: Maybe add some limitations here, for example, if the garbage ratio
-    // is less than a specific threshold, do not garbage collect it.
   }
 
   if (pick_res.first == kInvalidZoneId) {
@@ -1424,13 +1382,13 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
   }
 
   // If it already returns a valid gc hints, do not return the next one
-  if (get_gc_hints_time >= 1) {
-    return nullptr;
-  }
+  // if (get_gc_hints_time >= 1) {
+  //   return nullptr;
+  // }
 
   ++get_gc_hints_time;
-  ZnsLog(kCyan, "[ZenFS::GetFSGCHints]: Pick Zone %lu, GR: %.2lf",
-         pick_res.first, pick_res.second);
+  ZnsLog(kCyan, "[ZenFS::GetFSGCHints]: Pick Zone %lu, GR: %.2lf, Hotness: %s",
+         pick_res.first, pick_res.second, hotness.ToString().c_str());
 
   // Construct the returned GC hints
   auto ret = std::make_shared<Env::FSGCHints>();
@@ -1440,7 +1398,8 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
   input_zone.zone_id = pick_res.first;
   input_zone.file_numbers = zbd_->GetFilesOfZoneAsVec(pick_res.first);
 
-  ret->type = hotness;
+  assert(hotness.IsPartition());
+
   ret->input_zones.emplace_back(std::move(input_zone));
 
   return ret;
