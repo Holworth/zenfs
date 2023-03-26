@@ -625,6 +625,20 @@ double ZonedBlockDevice::GetPartitionGR() {
   return 1 - (double)valid_kv / total_kv;
 }
 
+double ZonedBlockDevice::GetPartitionGR(HotnessType type) {
+  auto p = GetPartition(type);
+  if (p == nullptr) {
+    return 0.0;
+  }
+  uint64_t total_kv = 1, valid_kv = 1;
+  for (const auto &zone_id : p->zones) {
+    auto gc_stat = GetZoneGCStatsOf(zone_id);
+    total_kv += gc_stat->no_kv;
+    valid_kv += gc_stat->no_valid_kv;
+  }
+  return 1 - (double)valid_kv / total_kv;
+}
+
 void ZonedBlockDevice::LogZoneStats() {
   uint64_t used_capacity = 0;
   uint64_t reclaimable_capacity = 0;
@@ -845,8 +859,12 @@ bool ZonedBlockDevice::GetActiveIOZoneTokenIfAvailable() {
    * the caller is allowed to write to a closed zone. The callee
    * is responsible for calling a PutActiveIOZoneToken to return the resource
    */
-  ZnsLog(kMagenta, "GetActiveIOZoneToken: %ld, limit=%ld",
+  ZnsLog(kMagenta, ">>>> GetActiveIOZoneTokenIfAvailable: %ld, limit=%ld",
          active_io_zones_.load(), max_nr_active_io_zones_);
+
+  if (active_io_zones_.load() == max_nr_active_io_zones_) {
+    assert(false);
+  }
   std::unique_lock<std::mutex> lk(zone_resources_mtx_);
   if (active_io_zones_.load() < max_nr_active_io_zones_) {
     active_io_zones_++;
@@ -868,7 +886,7 @@ void ZonedBlockDevice::PutOpenIOZoneToken() {
 }
 
 void ZonedBlockDevice::PutActiveIOZoneToken() {
-  ZnsLog(kMagenta, "PutActiveIOZoneToken: %ld", active_io_zones_.load());
+  ZnsLog(kMagenta, "<<<< PutActiveIOZoneToken: %ld", active_io_zones_.load());
   {
     std::unique_lock<std::mutex> lk(zone_resources_mtx_);
     active_io_zones_--;
@@ -1501,6 +1519,9 @@ IOStatus ZonedBlockDevice::MigrateAggregatedLevelZone() {
   // zone back. The destination zone takes the active/open token and will
   // absort incoming key sst writes
   //
+
+  ZnsLog(kYellow, "Open zones %lu and active zones %lu in %s",
+         open_io_zones_.load(), active_io_zones_.load(), __FUNCTION__);
   WaitForOpenIOZoneToken(false);
   while (!GetActiveIOZoneTokenIfAvailable())
     ;

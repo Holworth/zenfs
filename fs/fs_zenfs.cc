@@ -1359,6 +1359,7 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
   static int get_gc_hints_time = 0;
 
   auto pick_res = zbd_->PickZoneFromHotPartition();
+  // auto pick_res = std::make_pair<zone_id_t, double>(-1, 0.0);
   HotnessType hotness = HotnessType::Hot();
 
   if (pick_res.first == kInvalidZoneId) {
@@ -1398,7 +1399,7 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
   input_zone.zone_id = pick_res.first;
   input_zone.file_numbers = zbd_->GetFilesOfZoneAsVec(pick_res.first);
 
-  assert(hotness.IsPartition());
+  assert(hotness.IsPartition() || hotness.IsHot() || hotness.IsWarm());
 
   ret->input_zones.emplace_back(std::move(input_zone));
 
@@ -1801,8 +1802,25 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.used_space, kUsedSpace);
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.free_space, kFreeSpace);
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.occupy_space, kOccupySpace);
-    zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr * 1000,
-                                               kPartitionGR);
+    // zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr * 1000,
+    //                                            kPartitionGR);
+    zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr[0] * 1000,
+                                               kPartitionGR0);
+
+    zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr[1] * 1000,
+                                               kPartitionGR1);
+
+    zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr[2] * 1000,
+                                               kPartitionGR2);
+
+    zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr[3] * 1000,
+                                               kPartitionGR3);
+
+    zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.hot_partition_gr * 1000,
+                                               kPartitionGRHot);
+
+    zbd_->GetXMetrics()->RecordZNSGarbageRatio(
+        zbd_info.warm_partition_gr * 1000, kPartitionGRWarm);
   }
   if (options.zone_) {
     zbd_->GetZoneSnapshot(snapshot.zones_);
@@ -2230,6 +2248,15 @@ void ZenFS::UpdateTableProperties(const std::string& fname,
 }
 
 void ZenFS::MaybeReleaseGCWriteZone(HotnessType type) {
+  ZnsLog(kMagenta, "ZenFS::MaybeReleaseGCWriteZone (type: %s)",
+         type.ToString().c_str());
+  // Note that the GC write zone sharing only occures among hash partitions.
+  // There is no need to release a zone that is about to finish for Hot/Warm
+  // partition.
+  if (!type.IsPartition()) {
+    return;
+  }
+
   std::shared_ptr<ZonedBlockDevice::ZonePartition> p = nullptr;
   if (type.IsHot()) {
     p = zbd_->hot_partition_;
@@ -2245,15 +2272,23 @@ void ZenFS::MaybeReleaseGCWriteZone(HotnessType type) {
   assert(zone);
   zone->LoopForAcquire();
 
-  // If current zone has no enough space,  finish it and release all acquired
-  // token of this zone.
-  if (zone->GetCapacityLeft() < zbd_->GetZoneSize() * 0.05) {
+  // If current zone has no enough space,  finish it and release the
+  // active/open token of the GC write zone for this partition. 
+  if (zone->GetCapacityLeft() < zbd_->GetZoneSize() * 0.10) {
+    ZnsLog(kMagenta,
+           "Partition(%s) Release CurrentGCZone(%lu, Capacity: %lu MiB)",
+           type.ToString().c_str(), zone->ZoneId(),
+           ToMiB(zone->GetCapacityLeft()));
     auto s = p->FinishCurrGCWriteZone();
     if (!s.ok()) {
       assert(false);
     }
+    // Return the token
     zbd_->PutOpenIOZoneToken();
     zbd_->PutActiveIOZoneToken();
+  } else {
+    // Remember to release the ownership of this zone 
+    zone->CheckRelease();
   }
 }
 

@@ -872,8 +872,8 @@ IOStatus ZoneFile::GetZoneForFlushValueSSTWrite(Zone** write_zone) {
 
   if (prev_zone) {
     ZnsLog(kCyan,
-           "Partition(%d) Switch ActivateZone From Zone%lu(%lu MiB) to "
-           "Zone%lu(%lu MiB)",
+           "Partition(%d) Switch ActivateZone From Zone %lu(%lu MiB) to "
+           "Zone %lu(%lu MiB)",
            place_ftype_.PartitionId(), zone_id,
            ToMiB(prev_zone->GetCapacityLeft()), new_zone_id,
            ToMiB(new_zone->GetCapacityLeft()));
@@ -886,7 +886,7 @@ IOStatus ZoneFile::GetZoneForFlushValueSSTWrite(Zone** write_zone) {
 }
 
 IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
-  assert(IsGCOutputValueSST());
+  // assert(IsGCOutputValueSST());
   auto partition = GetPartition();
   auto zone_id = partition->GetCurrGCWriteZone();
   auto gc_write_zone = zbd_->GetZone(zone_id);
@@ -939,6 +939,8 @@ IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
   new_zone->LoopForAcquire();
 
   partition->SetCurrGCWriteZone(new_zone_id);
+
+  ZnsLog(kCyan, "Partition switch GC Zone to %lu", new_zone_id);
   *write_zone = new_zone;
 
   return s;
@@ -946,11 +948,11 @@ IOStatus ZoneFile::GetZoneForGCValueSSTWrite(Zone** write_zone) {
 
 IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
   assert(IsValueSST());
-  ZnsLog(kCyan, "ValueSSTAppend::Start (IsGC: %lu)", IsGCOutputValueSST());
-  Defer d([=]() {
-    ZnsLog(kCyan, "ValueSSTAppend::End (IsGC: %lu)",
-           this->IsGCOutputValueSST());
-  });
+  // ZnsLog(kCyan, "ValueSSTAppend::Start (IsGC: %lu)", IsGCOutputValueSST());
+  // Defer d([=]() {
+  //   ZnsLog(kCyan, "ValueSSTAppend::End (IsGC: %lu)",
+  //          this->IsGCOutputValueSST());
+  // });
 
   uint32_t left = data_size;
   uint32_t wr_size, offset = 0;
@@ -972,7 +974,11 @@ IOStatus ZoneFile::ValueSSTAppend(char* data, uint32_t data_size) {
     //
     Zone* write_zone = nullptr;
     if (!IsGCOutputValueSST()) {
-      s = GetZoneForFlushValueSSTWrite(&write_zone);
+      if (place_ftype_.IsPartition()) {
+        s = GetZoneForFlushValueSSTWrite(&write_zone);
+      } else {
+        s = GetZoneForGCValueSSTWrite(&write_zone);
+      }
       if (!s.ok()) {
         return s;
       }

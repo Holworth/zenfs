@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "io_zenfs.h"
+#include "rocksdb/env.h"
 #include "zbd_zenfs.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -34,7 +35,9 @@ class ZBDSnapshot {
   uint64_t used_space;
   uint64_t reclaimable_space;
   uint64_t occupy_space;
-  double partition_gr;
+  double partition_gr[16];
+  double hot_partition_gr;
+  double warm_partition_gr;
 
  public:
   ZBDSnapshot() = default;
@@ -43,8 +46,13 @@ class ZBDSnapshot {
       : free_space(zbd.GetFreeSpace()),
         used_space(zbd.GetUsedSpace()),
         reclaimable_space(zbd.GetReclaimableSpace()),
-        occupy_space(zbd.GetOccupySpace()),
-        partition_gr(zbd.GetPartitionGR()) {}
+        occupy_space(zbd.GetOccupySpace()) {
+    for (int i = 0; i < zbd.partition_num; ++i) {
+      partition_gr[i] = zbd.GetPartitionGR(HotnessType::Partition(i));
+    }
+    hot_partition_gr = zbd.GetPartitionGR(HotnessType::Hot());
+    warm_partition_gr = zbd.GetPartitionGR(HotnessType::Warm());
+  }
 };
 
 class ZoneSnapshot {

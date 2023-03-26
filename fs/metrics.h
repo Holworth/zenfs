@@ -228,6 +228,13 @@ enum XZenFSMetricsType : uint32_t {
 
   // Garbage ratio record
   kPartitionGR,
+  // Garbage ratio for hash partition 0, 1, 2, 3, hot, warm
+  kPartitionGR0,
+  kPartitionGR1,
+  kPartitionGR2,
+  kPartitionGR3,
+  kPartitionGRHot,
+  kPartitionGRWarm,
 };
 
 // A thread-safe metrics
@@ -287,7 +294,12 @@ struct XZenFSMetrics {
     Register(kUsedSpace, "zns_used_space_hist");
     Register(kOccupySpace, "zns_occupy_space_hist");
 
-    Register(kPartitionGR, "partition_garbage_ratio");
+    Register(kPartitionGR0, "partition0_garbage_ratio");
+    Register(kPartitionGR1, "partition1_garbage_ratio");
+    Register(kPartitionGR2, "partition2_garbage_ratio");
+    Register(kPartitionGR3, "partition3_garbage_ratio");
+    Register(kPartitionGRHot, "partition_hot_garbage_ratio");
+    Register(kPartitionGRWarm, "partition_warm_garbage_ratio");
   }
 
   // Dump when destructed
@@ -314,7 +326,7 @@ struct XZenFSMetrics {
     hist_map[type]->AtomicStore(index, size);
   }
 
-  // Since double does not support a full set of atomic operations. We use 
+  // Since double does not support a full set of atomic operations. We use
   // uint64_t to store the result of multiplying garbage ratio with 1000.
   void RecordZNSGarbageRatio(uint64_t size, XZenFSMetricsType type) {
     auto elapse_time = ElapseTime();

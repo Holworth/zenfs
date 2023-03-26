@@ -141,7 +141,7 @@ struct ZoneGCStats {
   // when a gc task is finished
   void Clear() {
     no_blobs = 0;
-    no_kv = 1;
+    no_kv = 0;
     no_valid_kv = 0;
     wasted_size = 0;
     in_zone_deprecated = 0;
@@ -157,9 +157,11 @@ struct ZoneGCStats {
     return std::string(buf);
   }
 
-  double GarbageRatio() const { return 1 - (double)no_valid_kv / no_kv; }
+  double GarbageRatio() const {
+    return no_kv == 0 ? 0 : 1 - (double)no_valid_kv / no_kv;
+  }
   double InZoneGarbageRatio() const {
-    return (double)in_zone_deprecated / no_kv;
+    return no_kv == 0 ? 0 : (double)in_zone_deprecated / no_kv;
   }
 };
 
@@ -431,6 +433,10 @@ class ZonedBlockDevice {
           ZnsLog(kCyan, "Partition() MaybeResetPendingZone: Zone%lu is reset",
                  zone->ZoneId());
           zbd->PushEmptyZone(z_id);
+          // Clear the GC stats as well:
+          auto gc_stat = zbd->GetZoneGCStatsOf(z_id);
+          gc_stat->Clear();
+
           return true;
         }
         zone->CheckRelease();
@@ -633,6 +639,7 @@ class ZonedBlockDevice {
   // between start space and write pointer of each zone
   uint64_t GetOccupySpace();
   double GetPartitionGR();
+  double GetPartitionGR(HotnessType type);
 
   std::string GetFilename();
   uint32_t GetBlockSize();
