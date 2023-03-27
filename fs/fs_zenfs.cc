@@ -1367,6 +1367,11 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
     hotness = HotnessType::Warm();
   }
 
+  // Temporarily disable GC on Hot/Warm partition to see if write stalls can 
+  // be alleviated. If the write stalls can be eliminated, that means we 
+  // should avoid mixing flush and gc write throughput together
+  pick_res.first = kInvalidZoneId;
+
   if (pick_res.first == kInvalidZoneId) {
     uint32_t p_id = -1;
     pick_res = zbd_->PickZoneFromHashPartition(&p_id);
@@ -1802,8 +1807,6 @@ void ZenFS::GetZenFSSnapshot(ZenFSSnapshot& snapshot,
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.used_space, kUsedSpace);
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.free_space, kFreeSpace);
     zbd_->GetXMetrics()->RecordZNSSpace(zbd_info.occupy_space, kOccupySpace);
-    // zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr * 1000,
-    //                                            kPartitionGR);
     zbd_->GetXMetrics()->RecordZNSGarbageRatio(zbd_info.partition_gr[0] * 1000,
                                                kPartitionGR0);
 
