@@ -8,6 +8,7 @@
 
 #include <cstdint>
 
+#include "fs/log.h"
 #include "fs/metrics.h"
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
@@ -27,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "async.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
 #include "zbd_zenfs.h"
@@ -82,6 +84,7 @@ class ZoneFile {
   uint64_t file_size_;
   uint64_t file_id_;
   uint64_t level_;
+
   // The placement hint passed above. Only valid when current file type is
   // ValueSST.
   PlacementFileType place_ftype_;
@@ -103,6 +106,20 @@ class ZoneFile {
 
   std::mutex writer_mtx_;
   std::atomic<int> readers_{0};
+
+  struct FileAsyncReadRequest {
+    AsyncIORequest io_req;
+    uint64_t offset = -1;
+    uint64_t sz = -1;
+  };
+
+  // The buffer for asynchronous read.
+  char* async_buf_;
+  size_t async_buf_size_;
+
+  FileAsyncReadRequest async_read_request_;
+
+  void AllocateAsyncBuffer(size_t size);
 
  public:
   static const int SPARSE_HEADER_SIZE = 8;
@@ -152,7 +169,7 @@ class ZoneFile {
   void SetLevel(uint64_t level);
 
   // Extract the file number of this file via filename, return -1 if it's not
-  // suffixed with ".sst". 
+  // suffixed with ".sst".
   uint64_t ExtractFileNumber() {
     uint64_t fn = -1;
 
@@ -235,6 +252,13 @@ class ZoneFile {
 
   IOStatus PositionedRead(uint64_t offset, size_t n, Slice* result,
                           char* scratch, bool direct);
+  IOStatus PrefetchAsync(uint64_t offset, size_t n, bool direct);
+
+  // A fast path for reading from async buffer if the requested data contents
+  // match the previous request
+  IOStatus MaybeReadFromAsyncBuffer(uint64_t offset, size_t n, Slice* result,
+                                    char* scratch);
+
   ZoneExtent* GetExtent(uint64_t file_offset, uint64_t* dev_offset);
   void PushExtent();
   IOStatus AllocateNewZone();
@@ -432,9 +456,16 @@ class ZonedRandomAccessFile : public FSRandomAccessFile {
                 Slice* result, char* scratch,
                 IODebugContext* dbg) const override;
 
-  IOStatus Prefetch(uint64_t /*offset*/, size_t /*n*/,
-                    const IOOptions& /*options*/,
+  IOStatus Prefetch(uint64_t offset, size_t n, const IOOptions& options,
                     IODebugContext* /*dbg*/) override {
+    return IOStatus::OK();
+  }
+
+  IOStatus PrefetchAsync(uint64_t offset, size_t n, const IOOptions& options,
+                         IODebugContext*) override {
+    if (zoneFile_) {
+      return zoneFile_->PrefetchAsync(offset, n, direct_);
+    }
     return IOStatus::OK();
   }
 

@@ -16,6 +16,7 @@
 #include "fs/log.h"
 #include "fs/metrics.h"
 #include "fs/zbd_zenfs.h"
+#include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
 #include "util/filename.h"
 #include "util/mutexlock.h"
@@ -579,6 +580,11 @@ IOStatus ZenFS::DeleteFileNoLock(std::string fname, const IOOptions& options,
   return s;
 }
 
+inline bool ends_with(std::string const& value, std::string const& ending) {
+  if (ending.size() > value.size()) return false;
+  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+}
+
 IOStatus ZenFS::NewSequentialFile(const std::string& filename,
                                   const FileOptions& file_opts,
                                   std::unique_ptr<FSSequentialFile>* result,
@@ -589,9 +595,18 @@ IOStatus ZenFS::NewSequentialFile(const std::string& filename,
   Debug(logger_, "New sequential file: %s direct: %d\n", fname.c_str(),
         file_opts.use_direct_reads);
 
-  if (zoneFile == nullptr) {
+  auto is_tmp = ends_with(fname, kTempFileNameSuffix);
+  if (zoneFile == nullptr || is_tmp) {
+    if (is_tmp) {
+      ZnsLog(kYellow, "Reading CURRENT file from Legacy Filesystem");
+    }
+
     return target()->NewSequentialFile(ToAuxPath(fname), file_opts, result,
                                        dbg);
+  }
+
+  if (is_tmp) {
+    ZnsLog(kYellow, "Reading CURRENT file from ZenFS");
   }
 
   result->reset(new ZonedSequentialFile(zoneFile, file_opts));
@@ -617,23 +632,44 @@ IOStatus ZenFS::NewRandomAccessFile(const std::string& filename,
   return IOStatus::OK();
 }
 
-inline bool ends_with(std::string const& value, std::string const& ending) {
-  if (ending.size() > value.size()) return false;
-  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
-}
-
 IOStatus ZenFS::NewWritableFile(const std::string& filename,
                                 const FileOptions& file_opts,
                                 std::unique_ptr<FSWritableFile>* result,
                                 IODebugContext* /*dbg*/) {
   std::string fname = FormatPathLexically(filename);
+  FileOptions real_opts(file_opts);
   Debug(logger_, "New writable file: %s direct: %d\n", fname.c_str(),
-        file_opts.use_direct_writes);
+        real_opts.use_direct_writes);
 
   ZnsLog(kCyan, "New writable file: %s direct: %d", fname.c_str(),
-         file_opts.use_direct_writes);
+         real_opts.use_direct_writes);
+  auto is_database_meta = real_opts.io_options.type == IOType::kManifest;
+  if (real_opts.io_options.type == IOType::kManifest) {
+    //
+    // Dealing with Manifest specially. The target() is basically a Posix
+    // filesystem, we currently put the manifest together with LOG.
+    //
+    // TODO: Once we have establish the usage of conventional zone, we will
+    // modify the ToAuxPath to another call, for example "ToMetaPath" so that
+    // Manifest can be correctly placed in conventional zone
+    //
+    ZnsLog(kYellow, "NewManifest: %s on LegacyFilesystem",
+           ToAuxPath(filename).c_str());
+    return target()->NewWritableFile(ToAuxPath(filename), real_opts, result,
+                                     nullptr);
+  } else if (real_opts.db_file_type == DBFileType::kTempFile) {
+    // the if condition above does not use file_opts.io_options.type
+    // because temp files are directly created via a call the
+    // ZenFS::NewWritableFile instead of ZenfsEnv::NewWritableFile, thus the
+    // io_options.type is not correct set at this point, we should correct it
+    // real_opts.io_options.type = IOType::kTempFile;
+    ZnsLog(kYellow, "Tempfile: %s on LegacyFilesystem",
+           ToAuxPath(filename).c_str());
+    return target()->NewWritableFile(ToAuxPath(filename), real_opts, result,
+                                     nullptr);
+  }
 
-  return OpenWritableFile(fname, file_opts, result, nullptr, false);
+  return OpenWritableFile(fname, real_opts, result, nullptr, false);
 }
 
 IOStatus ZenFS::ReuseWritableFile(const std::string& filename,
@@ -682,6 +718,10 @@ IOStatus ZenFS::ReopenWritableFile(const std::string& filename,
                                    const FileOptions& file_opts,
                                    std::unique_ptr<FSWritableFile>* result,
                                    IODebugContext* dbg) {
+  if (file_opts.io_options.type == IOType::kManifest) {
+    return target()->ReopenWritableFile(ToAuxPath(filename), file_opts, result,
+                                        dbg);
+  }
   std::string fname = FormatPathLexically(filename);
   Debug(logger_, "Reopen writable file: %s \n", fname.c_str());
 
@@ -1012,6 +1052,7 @@ IOStatus ZenFS::RenameFileNoLock(const std::string& src_path,
         dest_path.c_str());
 
   source_file = GetFileNoLock(source_path);
+
   if (source_file != nullptr) {
     existing_dest_file = GetFileNoLock(dest_path);
     if (existing_dest_file != nullptr) {
@@ -1021,6 +1062,8 @@ IOStatus ZenFS::RenameFileNoLock(const std::string& src_path,
       }
     }
 
+    ZnsLog(kYellow, "Renaming file %s to %s in ZenFS", source_path.c_str(),
+           dest_path.c_str());
     s = source_file->RenameLink(source_path, dest_path);
     if (!s.ok()) return s;
     files_.erase(source_path);
@@ -1036,6 +1079,9 @@ IOStatus ZenFS::RenameFileNoLock(const std::string& src_path,
       files_.insert(std::make_pair(source_path, source_file));
     }
   } else {
+    ZnsLog(kYellow, "Renaming file %s to %s in LegacyFileSystem", source_path.c_str(),
+           dest_path.c_str());
+
     s = RenameAuxPathNoLock(source_path, dest_path, options, dbg);
   }
 
@@ -1166,7 +1212,7 @@ Status ZenFS::DecodeFileUpdateFrom(Slice* slice, bool replace) {
   Status s;
 
   s = update->DecodeFrom(slice);
-  ZnsLog(kRed, "s = %s", s.ToString().c_str());
+  // ZnsLog(kRed, "s = %s", s.ToString().c_str());
   if (!s.ok()) return s;
 
   id = update->GetID();
@@ -1367,10 +1413,10 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
     hotness = HotnessType::Warm();
   }
 
-  // Temporarily disable GC on Hot/Warm partition to see if write stalls can 
-  // be alleviated. If the write stalls can be eliminated, that means we 
+  // Temporarily disable GC on Hot/Warm partition to see if write stalls can
+  // be alleviated. If the write stalls can be eliminated, that means we
   // should avoid mixing flush and gc write throughput together
-  pick_res.first = kInvalidZoneId;
+  // pick_res.first = kInvalidZoneId;
 
   if (pick_res.first == kInvalidZoneId) {
     uint32_t p_id = -1;
@@ -2276,7 +2322,7 @@ void ZenFS::MaybeReleaseGCWriteZone(HotnessType type) {
   zone->LoopForAcquire();
 
   // If current zone has no enough space,  finish it and release the
-  // active/open token of the GC write zone for this partition. 
+  // active/open token of the GC write zone for this partition.
   if (zone->GetCapacityLeft() < zbd_->GetZoneSize() * 0.10) {
     ZnsLog(kMagenta,
            "Partition(%s) Release CurrentGCZone(%lu, Capacity: %lu MiB)",
@@ -2290,7 +2336,7 @@ void ZenFS::MaybeReleaseGCWriteZone(HotnessType type) {
     zbd_->PutOpenIOZoneToken();
     zbd_->PutActiveIOZoneToken();
   } else {
-    // Remember to release the ownership of this zone 
+    // Remember to release the ownership of this zone
     zone->CheckRelease();
   }
 }
