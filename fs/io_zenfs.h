@@ -109,17 +109,25 @@ class ZoneFile {
 
   struct FileAsyncReadRequest {
     AsyncIORequest io_req;
-    uint64_t offset = -1;
-    uint64_t sz = -1;
+    // The requested data slice represented as file's offset and size
+    uint64_t file_req_offset = -1;
+    uint64_t file_req_sz = -1;
+
+    // The corresponding device offset for this request
+    uint64_t file_dev_offset = -1;
+
+    // The offset and size of the request issued to the device, page aligned
+    uint64_t dev_req_offset = -1;
+    uint64_t dev_req_sz = -1;
   };
 
   // The buffer for asynchronous read.
-  char* async_buf_;
-  size_t async_buf_size_;
+  char* async_buf_ = nullptr;
+  size_t async_buf_size_ = 0;
 
   FileAsyncReadRequest async_read_request_;
 
-  void AllocateAsyncBuffer(size_t size);
+  void MaybeAllocateAsyncBuffer(size_t size);
 
  public:
   static const int SPARSE_HEADER_SIZE = 8;
@@ -464,7 +472,7 @@ class ZonedRandomAccessFile : public FSRandomAccessFile {
   IOStatus PrefetchAsync(uint64_t offset, size_t n, const IOOptions& options,
                          IODebugContext*) override {
     if (zoneFile_) {
-      return zoneFile_->PrefetchAsync(offset, n, direct_);
+      return zoneFile_->PrefetchAsync(offset, n, true);
     }
     return IOStatus::OK();
   }

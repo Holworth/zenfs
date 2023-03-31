@@ -4,15 +4,18 @@
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
 #include "fs/fs_zenfs.h"
 #include "fs/log.h"
 #include "fs/metrics.h"
+#include "fs/util.h"
 #include "fs/zbd_zenfs.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/metrics_reporter.h"
 #if !defined(ROCKSDB_LITE) && !defined(OS_WIN)
 
 #include <assert.h>
@@ -31,6 +34,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstring>
 
 #include "io_zenfs.h"
 #include "rocksdb/env.h"
@@ -421,14 +425,23 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
                                  Env::Default());
   zbd_->GetMetrics()->ReportQPS(ZENFS_READ_QPS, 1);
   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_READ_THROUGHPUT, n);
-  // ZnsLog(kMagenta, "ZoneFile(%s) PositionedRead(%lu, %lu)",
-  //        GetFilename().c_str(), offset, n);
+
+  if (IsValueSST()) {
+     // ZnsLog(kMagenta, "ZoneFile(%s) PositionedRead(%lu, %lu)",
+     //       GetFilename().c_str(), offset, n);
+  }
 
   ReadLock lck(this);
+  auto start2 = std::chrono::steady_clock::now();
 
-  // Fast path for reading from async buffer
+  // Fast path for reading from AsyncIO buffer
+  auto start = std::chrono::steady_clock::now();
   auto stat = MaybeReadFromAsyncBuffer(offset, n, result, scratch);
+  auto end = std::chrono::steady_clock::now();
+  auto dura =
+      std::chrono::duration_cast<std::chrono::microseconds>(end - start);
   if (stat.ok()) {
+    ZnsLog(kMagenta, "MaybeReadFromAsyncBuffer Succ: %lu us", dura.count());
     return stat;
   }
 
@@ -523,13 +536,23 @@ IOStatus ZoneFile::PositionedRead(uint64_t offset, size_t n, Slice* result,
     read = 0;
   }
 
+  auto end2 = std::chrono::steady_clock::now();
+  auto dura2 =
+      std::chrono::duration_cast<std::chrono::microseconds>(end2 - start2);
+  if (IsValueSST()) {
+    // ZnsLog(kMagenta, "ZoneFile(%s) Positioned Read (%lu, %lu): %lu us",
+    //        GetFilename().c_str(), offset, n, dura2.count());
+  }
+
   *result = Slice((char*)scratch, read);
   return s;
 }
 
 IOStatus ZoneFile::PrefetchAsync(uint64_t offset, size_t n, bool direct) {
-  ZnsLog(kMagenta, "ZonedRandomAccessFile(%s) Prefetch (%lu, %lu)",
-         GetFilename().c_str(), offset, n);
+  static const uint64_t kPageSize = sysconf(_SC_PAGESIZE);
+
+  // ZnsLog(kMagenta, "ZonedRandomAccessFile(%s) PrefetchAsync (%lu, %lu)",
+  //        GetFilename().c_str(), offset, n);
   if (async_read_request_.io_req.IsPending()) {
     // There is already an async request pending. Any new asynchronous
     // request will be rejected.
@@ -538,53 +561,76 @@ IOStatus ZoneFile::PrefetchAsync(uint64_t offset, size_t n, bool direct) {
     return IOStatus::Busy("PrefetchAsync Request busy");
   }
 
+  // We need to use Direct IO to access the data if we expect any benefit
+  // from asynchronous IO. See:  https://github.com/axboe/fio/issues/512
+  assert(direct == true);
   IOStatus s = IOStatus::OK();
-
-  // Round up this n:
-  uint64_t read_sz = n;
-  bool aligned = (read_sz % zbd_->GetBlockSize() == 0);
-  size_t bytes_to_align = 0;
-  if (direct && !aligned) {
-    bytes_to_align = zbd_->GetBlockSize() - (read_sz % zbd_->GetBlockSize());
-    read_sz += bytes_to_align;
-    aligned = true;
-    assert(read_sz % zbd_->GetBlockSize() == 0);
-  }
-
-
-  AllocateAsyncBuffer(read_sz);
 
   //
   // Translate the file offset to a device address: Note that we assume the
   // request data is within one extent. This is true for all blob files since
   // all contents of a blob file are written in the same zone.
   //
+  // The dev_offset needs to be page aligned for direct IO.
+  //
   uint64_t dev_offset = -1;
   auto extent = GetExtent(offset, &dev_offset);
   assert(dev_offset != -1 && extent != nullptr);
+  // The requested data can not be separated
+  assert(offset + n <= extent->start_ + extent->length_);
+
+  auto aligned_dev_offset = round_down_align(dev_offset, kPageSize);
+  // size to read for aligned offset
+  auto aligned_n = dev_offset + n - aligned_dev_offset;
+  auto read_sz = round_up_align(aligned_n, kPageSize);
+
+  // // Round up this aligned_n:
+  // uint64_t read_sz = aligned_n;
+  // bool aligned = (read_sz % zbd_->GetBlockSize() == 0);
+  // size_t bytes_to_align = 0;
+  // if (direct && !aligned) {
+  //   bytes_to_align = zbd_->GetBlockSize() - (read_sz % zbd_->GetBlockSize());
+  //   read_sz += bytes_to_align;
+  //   aligned = true;
+  //   assert(read_sz % zbd_->GetBlockSize() == 0);
+  // }
+
+  MaybeAllocateAsyncBuffer(read_sz);
 
   // Send the asynchronous requests out:
-  assert(async_read_request_.offset == -1);
-  async_read_request_.offset = offset;
-  async_read_request_.sz = n;
+  assert(async_read_request_.file_req_offset == -1);
+  async_read_request_.file_req_offset = offset;
+  async_read_request_.file_req_sz = n;
+  async_read_request_.file_dev_offset = dev_offset;
+  async_read_request_.dev_req_offset = aligned_dev_offset;
+  async_read_request_.dev_req_sz = read_sz;
 
-  auto fd = direct ? zbd_->GetReadDirectFD() : zbd_->GetReadFD();
-  async_read_request_.io_req.Init();
-  async_read_request_.io_req.PrepareRead(fd, read_sz, dev_offset, async_buf_);
+  s = async_read_request_.io_req.Init();
+  if (!s.ok()) {
+    assert(false);
+    return s;
+  }
+  async_read_request_.io_req.PrepareRead(zbd_->GetReadDirectFD(), read_sz,
+                                         aligned_dev_offset, async_buf_);
   s = async_read_request_.io_req.Submit();
   if (!s.ok()) {
     assert(false);
     return s;
   }
 
+  ZnsLog(kMagenta,
+         "ZonedRandomAccessFile(%s) PrefetchAsync (%lu, %lu) Successfully",
+         GetFilename().c_str(), offset, n);
   return IOStatus::OK();
 }
 
 IOStatus ZoneFile::MaybeReadFromAsyncBuffer(uint64_t offset, size_t n,
                                             Slice* result, char* scratch) {
-  auto match_last_async_req =
-      offset == async_read_request_.offset && n == async_read_request_.sz;
+  auto match_last_async_req = offset == async_read_request_.file_req_offset &&
+                              n == async_read_request_.file_req_sz;
   if (!match_last_async_req) {
+    // ZnsLog(kMagenta, "ZoneFile(%s) MaybeReadFromAsyncBuffer not match",
+    //        GetFilename().c_str());
     return IOStatus::AsyncError(
         "Read request does not match last async request");
   }
@@ -599,11 +645,28 @@ IOStatus ZoneFile::MaybeReadFromAsyncBuffer(uint64_t offset, size_t n,
 
   // Previous async IO finished: copy the data to the user requested
   // buffer. However, this still triggers a memory copy, I'm suspecting
-  // if the upper layer can directly use the buffer inside
-  std::memmove(scratch, async_buf_, n);
+  // if the upper layer can directly use the async buffer here
+  //
+  // Do some address transfer:
+  assert(async_read_request_.dev_req_offset <=
+         async_read_request_.file_dev_offset);
+  auto delta =
+      async_read_request_.file_dev_offset - async_read_request_.dev_req_offset;
+  // auto start = std::chrono::steady_clock::now();
+  std::memcpy(scratch, async_buf_ + delta, n);
+  // auto end = std::chrono::steady_clock::now();
+  // auto dura =
+  //     std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+  // ZnsLog(kMagenta, "MaybeReadFromAsyncBuffer::memmove %lu us", dura.count());
   *result = Slice(scratch, n);
-  ZnsLog(kMagenta, "ZoneFile(%s) Read From AsyncBuffer successfully (%lu, %lu)",
-         GetFilename().c_str(), offset, n);
+  // ZnsLog(kMagenta, "ZoneFile(%s) Read From AsyncBuffer successfully (%lu,
+  // %lu)",
+  //        GetFilename().c_str(), offset, n);
+
+  // Reset the request states to make it invalid
+  async_read_request_.file_req_offset = -1;
+  async_read_request_.file_req_sz = -1;
+  async_read_request_.io_req.pending_async = false;
 
   return IOStatus::OK();
 }
@@ -1825,18 +1888,21 @@ IOStatus ZoneFile::MigrateData(uint64_t offset, uint32_t length,
   return IOStatus::OK();
 }
 
-void ZoneFile::AllocateAsyncBuffer(size_t alloc_size) {
+void ZoneFile::MaybeAllocateAsyncBuffer(size_t alloc_size) {
+  const static uint64_t kPageSize = sysconf(_SC_PAGESIZE);
   // Use the existed buffer
   if (async_buf_ && async_buf_size_ >= alloc_size) {
     return;
   }
-  auto pg_size = sysconf(_SC_PAGESIZE);
-  alloc_size = (alloc_size - 1) / pg_size + 1;
+  alloc_size = round_up_align(alloc_size, kPageSize);
+  // Release the previous allocated buffer
   if (async_buf_) {
+    assert(!async_read_request_.io_req.IsPending());
     free(async_buf_);
+    async_buf_ = nullptr;
     async_buf_size_ = 0;
   }
-  posix_memalign((void**)&async_buf_, sysconf(_SC_PAGESIZE), alloc_size);
+  posix_memalign((void**)&async_buf_, kPageSize, alloc_size);
   if (async_buf_) {
     async_buf_size_ = alloc_size;
   }

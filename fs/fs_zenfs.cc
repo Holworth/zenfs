@@ -1416,7 +1416,7 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
   // Temporarily disable GC on Hot/Warm partition to see if write stalls can
   // be alleviated. If the write stalls can be eliminated, that means we
   // should avoid mixing flush and gc write throughput together
-  // pick_res.first = kInvalidZoneId;
+  pick_res.first = kInvalidZoneId;
 
   if (pick_res.first == kInvalidZoneId) {
     uint32_t p_id = -1;

@@ -51,3 +51,12 @@ struct CombinationIterator {
 
   bool Valid() const { return valid_; }
 };
+
+inline uint64_t round_up_align(uint64_t d, uint64_t align) {
+  return (d - 1) / align * align + align;
+}
+
+inline uint64_t round_down_align(uint64_t d, uint64_t align) {
+  return d / align * align;
+}
+
