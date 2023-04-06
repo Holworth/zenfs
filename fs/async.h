@@ -34,6 +34,17 @@ struct AsyncIORequest {
     return IOStatus::OK();
   }
 
+  // Abort this request
+  IOStatus Cancel() {
+    assert(IsPending());
+    auto ret = io_cancel(ctx, &cb, nullptr);
+    if (ret < 0) {
+      return IOStatus::AsyncError("Cancel aio request failed: " +
+                                  std::string(strerror(errno)));
+    }
+    return IOStatus::OK();
+  }
+
   // Initialize an async read command
   void PrepareRead(int fd, size_t sz, uint64_t off, char* buf) {
     io_prep_pread(&cb, fd, buf, sz, off);

@@ -92,6 +92,7 @@ void Zone::EncodeJson(std::ostream &json_stream) {
 }
 
 IOStatus Zone::Reset() {
+  ZnsLog(kRed, "Zone%lu is to be reset", ZoneId());
   size_t zone_sz = zbd_->GetZoneSize();
   unsigned int report = 1;
   struct zbd_zone z;
@@ -488,6 +489,7 @@ void ZonedBlockDevice::InitializePartitions() {
         std::make_shared<HashPartition>(std::unordered_set<zone_id_t>(), this);
     hash_partitions_[i]->SetActivateZone(kInvalidZoneId);
   }
+  gc_hist_ = std::make_shared<PartitionGCHist>();
 }
 
 std::pair<zone_id_t, double> ZonedBlockDevice::PickZoneWithHighestGarbageRatio(
@@ -514,21 +516,27 @@ std::pair<zone_id_t, double> ZonedBlockDevice::PickZoneFromHashPartition(
 
   // First check if there exists some partition that contains an active GC
   // zone. If there is, use this partition preferably to save active token:
-  uint64_t partition_with_active_token = -1;
-  for (uint64_t i = 0; i < partition_num; ++i) {
-    if (hash_partitions_[i]->curr_gc_write_zone != kInvalidZoneId) {
-      partition_with_active_token = i;
+  uint32_t partition_with_gc_token = -1;
+  for (uint32_t i = 0; i < partition_num; ++i) {
+    if (hash_partitions_[i]->HasGCWriteZone()) {
+      partition_with_gc_token = i;
     }
   }
 
-  if (partition_with_active_token != -1) {
+  if (partition_with_gc_token != -1) {
     // There is a partition that holds a token for its garbage collection
-    // zone. We check if there is a zone can garbage collected
-    assert(partition_with_active_token < partition_num);
-    auto [id, gr] = PickZoneWithHighestGarbageRatio(
-        hash_partitions_[partition_with_active_token].get());
-    *partition_id = partition_with_active_token;
-    return {id, gr};
+    // zone. We preferably select this partition for garbage collection
+    // due to the considerations of limited number of active zone token.
+    //
+    // However, a partition might be constantly selected to for garbage
+    // collection if it owns a GC write zone from the beginning. This may
+    // leave other partitions not touched at all.
+    //
+    // We check if the partition with active token has been selected for
+    // garbage collection consecutively and switch to another partition
+    // in a round robin manner
+    assert(partition_with_gc_token < partition_num);
+    return MaybeSwitchToAnotherPartition(partition_with_gc_token, partition_id);
   } else {
     double max_gr = 0.00;
     for (uint64_t i = 0; i < partition_num; ++i) {
@@ -542,6 +550,40 @@ std::pair<zone_id_t, double> ZonedBlockDevice::PickZoneFromHashPartition(
     }
     return {ret_zone, max_gr};
   }
+}
+
+std::pair<zone_id_t, double> ZonedBlockDevice::MaybeSwitchToAnotherPartition(
+    uint32_t partition, uint32_t *choose_partition) {
+  assert(partition != -1);
+  auto gc_write_zone =
+      GetZone(hash_partitions_[partition]->GetCurrGCWriteZone());
+  assert(gc_write_zone != nullptr);
+
+  // We can continue choose this partition for garbage collection if it has
+  // not been garbage collected for many times. We try picking a zone from
+  // this partition for garbage collection if it has such a zone satisfy our
+  // gc threshold
+  auto gc_count = gc_hist_->LatestGCCount(partition);
+  if (gc_count < 5) {
+    *choose_partition = partition;
+    return PickZoneWithHighestGarbageRatio(hash_partitions_[partition].get());
+  }
+
+  // Otherwise we finish the current gc write zone of the previous partition
+  // and switch to the next partition
+  gc_write_zone->LoopForAcquire();
+  auto s = hash_partitions_[partition]->FinishCurrGCWriteZone();
+  ZnsLog(kMagenta,
+         "MaybeSwitchToAnotherPartition: Finish partition(%lu) gc write zone",
+         partition);
+  assert(s.ok());
+  PutActiveIOZoneToken();
+  PutOpenIOZoneToken();
+
+  auto next_partition = (partition + 1) % partition_num;
+  *choose_partition = next_partition;
+  return PickZoneWithHighestGarbageRatio(
+      hash_partitions_[next_partition].get());
 }
 
 void ZonedBlockDevice::InitEmptyZoneQueue() {
@@ -1253,7 +1295,14 @@ IOStatus ZonedBlockDevice::ResetUnusedKeySSTZones() {
         IOStatus reset_status = z->Reset();
         IOStatus release_status = z->CheckRelease();
         if (!release_status.ok()) return release_status;
-        if (!full) PutActiveIOZoneToken();
+        if (!full) {
+          PutActiveIOZoneToken();
+          keysst_aggr_zone_active_count_--;
+        }
+        PutOpenIOZoneToken();
+        keysst_aggr_zone_open_count_--;
+
+        ZnsLogKeySSTZoneToken();
       } else {
         IOStatus release_status = z->CheckRelease();
         if (!release_status.ok()) return release_status;

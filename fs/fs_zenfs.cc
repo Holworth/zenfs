@@ -1079,8 +1079,8 @@ IOStatus ZenFS::RenameFileNoLock(const std::string& src_path,
       files_.insert(std::make_pair(source_path, source_file));
     }
   } else {
-    ZnsLog(kYellow, "Renaming file %s to %s in LegacyFileSystem", source_path.c_str(),
-           dest_path.c_str());
+    ZnsLog(kYellow, "Renaming file %s to %s in LegacyFileSystem",
+           source_path.c_str(), dest_path.c_str());
 
     s = RenameAuxPathNoLock(source_path, dest_path, options, dbg);
   }
@@ -1395,35 +1395,43 @@ std::pair<std::unordered_set<uint64_t>, HotnessType> ZenFS::GetGCHintsFromFS(
 }
 
 std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
+  const int kGCIntervalSeconds = 3;
+
   // This is a parameter that controls if the GC runs aggresively. For
   // partition zone, if its garbage ratio is less than this threshold,
   // it will not be used for GC.
   const double kPartitionZoneGCThreshold = 0.4;
 
-  // (ZNS DEBUG): Limit the number of returning valid Zone Id for debugging
-  // purpose
+  // (ZNS DEBUG): Limit the number of returning valid Zone Id for
+  // debugging purpose: We only want to GC once currently
   static int get_gc_hints_time = 0;
 
   auto pick_res = zbd_->PickZoneFromHotPartition();
-  // auto pick_res = std::make_pair<zone_id_t, double>(-1, 0.0);
   HotnessType hotness = HotnessType::Hot();
+  pick_res.first = kInvalidZoneId;
 
   if (pick_res.first == kInvalidZoneId) {
     pick_res = zbd_->PickZoneFromWarmPartition();
     hotness = HotnessType::Warm();
   }
 
-  // Temporarily disable GC on Hot/Warm partition to see if write stalls can
-  // be alleviated. If the write stalls can be eliminated, that means we
-  // should avoid mixing flush and gc write throughput together
-  pick_res.first = kInvalidZoneId;
+  // Temporarily disable GC on Hot/Warm partition to see if write
+  // stalls can be alleviated. If the write stalls can be eliminated,
+  // that means we should avoid mixing flush and gc write throughput
+  // together
+  // pick_res.first = kInvalidZoneId;
 
   if (pick_res.first == kInvalidZoneId) {
+    // For Hash partition GC, we must control the frequency it occurs
+    if (Env::Default()->NowMicros() - zbd_->last_gc_finish_time_ <
+        kGCIntervalSeconds * 1e6) {
+      return nullptr;
+    }
     uint32_t p_id = -1;
     pick_res = zbd_->PickZoneFromHashPartition(&p_id);
     hotness = HotnessType::Partition(p_id);
-    // TODO: Maybe add some limitations here, for example, if the garbage ratio
-    // is less than a specific threshold, do not garbage collect it.
+    // TODO: Maybe add some limitations here, for example, if the garbage
+    // ratio is less than a specific threshold, do not garbage collect it.
     if (pick_res.second < kPartitionZoneGCThreshold) {
       pick_res.first = kInvalidZoneId;
     }
@@ -1433,7 +1441,7 @@ std::shared_ptr<Env::FSGCHints> ZenFS::GetFSGCHints() {
     return nullptr;
   }
 
-  // If it already returns a valid gc hints, do not return the next one
+  // If it already returns a valid gc hints, do not return the current one
   // if (get_gc_hints_time >= 1) {
   //   return nullptr;
   // }
@@ -1467,48 +1475,48 @@ void ZenFS::NotifyGarbageCollectionFinish(const Compaction* c) {
     auto z = zbd_->GetZone(z_id);
     assert(z->IsFull());
 
-    // Remove this zone from this partition temporarily
+    // Remove this zone from this partition
     p->RemoveZone(z_id);
-
-    // Actually there is no need to acuqire the lock of this zone
-    // since it is full: No write can access this zone and read
-    // does not need to acquire lock of this zone
-    z->LoopForAcquire();
-    if (z->used_capacity_ == 0) {
-      auto s = z->Reset();
-      if (s.ok()) {
-        // This zone will be reused
-        zbd_->PushEmptyZone(z_id);
-        ZnsLog(kCyan, "NotifyGarbageCollectionFinish: Zone%lu is reset",
-               z->ZoneId());
-      } else {
-        p->AddPendingResetZone(z_id);
-      }
-    } else {
-      p->AddPendingResetZone(z_id);
-    }
-    z->CheckRelease();
+    p->AddPendingResetZone(z_id, c->gc_write_bytes);
   }
+
+  p->MaybeResetPendingZones();
+
+  if (c->hotness_type().IsPartition()) {
+    zbd_->gc_hist_->MarkGC(c->hotness_type().PartitionId());
+  }
+  zbd_->last_gc_finish_time_ = Env::Default()->NowMicros();
 }
 
 void ZenFS::DumpZoneGCStats() {
   std::ofstream of;
   of.open("gc_stats");
 
+  uint64_t hash_partition_reclaim = 0;
+  uint64_t hot_warm_partition_reclaim = 0;
+
   // Dump the status of each partition
   for (int i = 0; i < zbd_->partition_num; ++i) {
     of << "[Partition" << i << "]:\n";
     of << zbd_->hash_partitions_[i]->Dump();
     of << "\n";
+    hash_partition_reclaim += zbd_->hash_partitions_[i]->gc_reclaim;
   }
 
   of << "[Partition Hot]\n";
   of << zbd_->hot_partition_->Dump();
   of << "\n";
+  hot_warm_partition_reclaim += zbd_->hot_partition_->gc_reclaim;
 
   of << "[Partition Warm]\n";
   of << zbd_->warm_partition_->Dump();
   of << "\n";
+  hot_warm_partition_reclaim += zbd_->warm_partition_->gc_reclaim;
+
+  double reclaim_ratio = (double)hot_warm_partition_reclaim /
+                         (hot_warm_partition_reclaim + hash_partition_reclaim);
+
+  of << "[Hot / Hash Reclaim Ratio]: " << reclaim_ratio << "\n";
 
   of.close();
 }

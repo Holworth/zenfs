@@ -31,6 +31,7 @@
 #include "async.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
+#include "util.h"
 #include "zbd_zenfs.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -108,22 +109,103 @@ class ZoneFile {
   std::atomic<int> readers_{0};
 
   struct FileAsyncReadRequest {
+    // State of this request
+    // The state transfer are as follows:
+    // Idle ---------> Pending ----------> Finish ----------> Idle
+    //      Submit()          CheckFinish()         Reset()
+    enum State {
+      kIdle,
+      kPending,
+      kFinish,
+    };
+
     AsyncIORequest io_req;
-    // The requested data slice represented as file's offset and size
-    uint64_t file_req_offset = -1;
-    uint64_t file_req_sz = -1;
+    State state = kIdle;
 
-    // The corresponding device offset for this request
-    uint64_t file_dev_offset = -1;
+    uint64_t file_req_offset;  // file offset of this request
+    uint64_t file_req_sz;      // size of this file request
+    uint64_t file_dev_offset;  // translated device offset
+    uint64_t dev_req_offset;   // offset of request sent to device
+    uint64_t dev_req_sz;       // size of request sent to device
 
-    // The offset and size of the request issued to the device, page aligned
-    uint64_t dev_req_offset = -1;
-    uint64_t dev_req_sz = -1;
+    // The buffer for asynchronous read.
+    char* async_buf_ = nullptr;
+    size_t async_buf_size_ = 0;
+
+    void Init() {
+      file_req_offset = 0;
+      file_req_sz = 0;
+      file_dev_offset = 0;
+      dev_req_offset = 0;
+      dev_req_sz = 0;
+      state = kIdle;
+    }
+
+    IOStatus Reset() {
+      file_req_offset = 0;
+      file_req_sz = 0;
+      file_dev_offset = 0;
+      dev_req_offset = 0;
+      dev_req_sz = 0;
+
+      // Set the io_req state accordingly: 
+      if (IsPending()) {
+        // Cancel the request that is being pending
+        auto s = io_req.Cancel();
+      }
+      state = kIdle;
+      return IOStatus::OK();
+    }
+
+    bool IsPending() const { return state == kPending; }
+    void SetPending() { state = kPending; }
+
+    bool IsIdle() const { return state == kIdle; }
+    void SetIdle() { state = kPending; }
+
+    bool IsFinish() const { return state == kFinish; }
+    void SetFinish() { state = kFinish; }
+
+    bool Contain(uint64_t offset, size_t n) {
+      auto limit = file_req_offset + file_req_sz;
+      return file_req_offset <= offset && (offset + n) <= limit;
+    }
+
+    // Check if the extent (offset, offset + n) has been much
+    // exceeds this async buffer.
+    bool Exceeds(uint64_t offset, size_t n) {
+      auto limit = file_req_offset + file_req_sz;
+      return offset >= limit;
+    }
+
+    void MaybeAllocateAsyncBuffer(size_t alloc_size) {
+      const static uint64_t kPageSize = sysconf(_SC_PAGESIZE);
+      // Use the existed buffer
+      if (async_buf_ && async_buf_size_ >= alloc_size) {
+        return;
+      }
+      alloc_size = round_up_align(alloc_size, kPageSize);
+      // Release the previous allocated buffer
+      if (async_buf_) {
+        assert(IsIdle());
+        free(async_buf_);
+        async_buf_ = nullptr;
+        async_buf_size_ = 0;
+      }
+      posix_memalign((void**)&async_buf_, kPageSize, alloc_size);
+      if (async_buf_) {
+        async_buf_size_ = alloc_size;
+      }
+    }
+
+    void Read(uint64_t offset, size_t n, Slice* result, char* scratch) {
+      assert(dev_req_offset <= file_dev_offset);
+      auto delta =
+          (offset - file_req_offset) + (file_dev_offset - dev_req_offset);
+      std::memcpy(scratch, async_buf_ + delta, n);
+      *result = Slice(scratch, n);
+    }
   };
-
-  // The buffer for asynchronous read.
-  char* async_buf_ = nullptr;
-  size_t async_buf_size_ = 0;
 
   FileAsyncReadRequest async_read_request_;
 
@@ -262,8 +344,8 @@ class ZoneFile {
                           char* scratch, bool direct);
   IOStatus PrefetchAsync(uint64_t offset, size_t n, bool direct);
 
-  // A fast path for reading from async buffer if the requested data contents
-  // match the previous request
+  // A fast path for reading from async buffer if the requested data is
+  // contained in the async buffer
   IOStatus MaybeReadFromAsyncBuffer(uint64_t offset, size_t n, Slice* result,
                                     char* scratch);
 

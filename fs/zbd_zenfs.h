@@ -375,6 +375,11 @@ class ZonedBlockDevice {
     // tokens' inadequacy.
     //
     zone_id_t curr_gc_write_zone = kInvalidZoneId;
+    uint64_t gc_write_zone_wasted = 0;
+    uint64_t gc_reclaim = 0;
+    uint64_t reset_count = 0;
+
+    bool HasGCWriteZone() const { return curr_gc_write_zone != kInvalidZoneId; }
 
     //
     // A zone used for garbage collection can not be reset immediately after
@@ -384,7 +389,15 @@ class ZonedBlockDevice {
     // We use a pending queue to delay the actual reset operation of logically
     // reclaimed zones until all files in this zone has been deleted.
     //
-    std::deque<zone_id_t> pending_reset_zones;
+    // The second field of the element in pending_reset_zones marks the
+    // timepoint this zone is added into this queue. It will be used to
+    // calculate the time interval between its adding and reset
+    struct PendingZoneStats {
+      zone_id_t z_id;
+      uint64_t add_time;
+      uint64_t gc_write_bytes; // number of bytes written gc this zone
+    };
+    std::deque<PendingZoneStats> pending_reset_zones;
     std::mutex pending_reset_zone_mtx;  // For concurrent control
 
     ZonePartition(const std::unordered_set<zone_id_t> &_zones,
@@ -397,9 +410,9 @@ class ZonedBlockDevice {
     zone_id_t GetCurrGCWriteZone() const { return curr_gc_write_zone; }
     void SetCurrGCWriteZone(zone_id_t zone) { curr_gc_write_zone = zone; }
 
-    void AddPendingResetZone(zone_id_t zone) {
+    void AddPendingResetZone(zone_id_t zone, uint64_t bytes) {
       std::scoped_lock<std::mutex> lck(pending_reset_zone_mtx);
-      pending_reset_zones.push_back(zone);
+      pending_reset_zones.push_back({zone, Env::Default()->NowMicros(), bytes});
     }
 
     // Manipulate interface for contained zones in this partition
@@ -418,7 +431,9 @@ class ZonedBlockDevice {
     void MaybeResetPendingZones() {
       // ZnsLog(kCyan, "MaybeResetPendingZones: Start");
       std::scoped_lock<std::mutex> lck(pending_reset_zone_mtx);
-      auto reset_zone = [&](uint64_t z_id) -> bool {
+      auto reset_zone =
+          [&](const auto &elem) -> bool {
+        auto z_id = elem.z_id;
         auto zone = zbd->GetZone(z_id);
         assert(zone->IsFull());
         zone->LoopForAcquire();
@@ -430,8 +445,15 @@ class ZonedBlockDevice {
           if (!s.ok()) {
             return false;
           }
-          ZnsLog(kCyan, "Partition() MaybeResetPendingZone: Zone%lu is reset",
-                 zone->ZoneId());
+          uint64_t reset_end = Env::Default()->NowMicros();
+          ZnsLog(kCyan,
+                 "Partition() MaybeResetPendingZone: Zone%lu is reset (pass: "
+                 "%lu us)",
+                 zone->ZoneId(), reset_end - elem.add_time);
+          // Record the bytes reclaimed by GC: it releases bytes of zone size 
+          // but incurs "gc_write_bytes" write. 
+          gc_reclaim += (zbd->GetZoneSize() - elem.gc_write_bytes);
+          reset_count += 1;
           zbd->PushEmptyZone(z_id);
           // Clear the GC stats as well:
           auto gc_stat = zbd->GetZoneGCStatsOf(z_id);
@@ -458,6 +480,8 @@ class ZonedBlockDevice {
            << "][Capacity: " << ToMiB(zone->GetCapacityLeft()) << "MiB]";
         ss << gc_stat->Dump() << "\n";
       }
+      ss << "[GC Reclaim: " << ToMiB(gc_reclaim) << "MiB]" << "\n";
+      ss << "[ResetCount: " << reset_count << "]\n";
       return ss.str();
     }
 
@@ -470,6 +494,7 @@ class ZonedBlockDevice {
       }
       auto gc_write_zone = zbd->GetZone(curr_gc_write_zone);
       bool full = gc_write_zone->IsFull();
+      gc_write_zone_wasted += gc_write_zone->GetCapacityLeft();
       zbd->GetZoneGCStatsOf(curr_gc_write_zone)->wasted_size +=
           gc_write_zone->GetCapacityLeft();
       // Finish this zone when it has no enough space
@@ -498,11 +523,27 @@ class ZonedBlockDevice {
         : ZonePartition(_zones, _zbd) {}
   };
 
+  struct PartitionGCHist {
+    uint64_t hist_bit_map[kMaxPartitionNum] = {0};
+
+    void MarkGC(uint64_t partition) {
+      for (uint64_t i = 0; i < 4; ++i) {
+        hist_bit_map[i] <<= 1;
+      }
+      hist_bit_map[partition] |= 0x01;
+    }
+
+    int LatestGCCount(uint64_t partition) {
+      return __builtin_ctzl(~hist_bit_map[partition]);
+    }
+  };
+
   // This field should be initialized from the constructor parameters.
   uint32_t partition_num = 4;
   std::shared_ptr<HashPartition> hash_partitions_[kMaxPartitionNum];
   std::shared_ptr<HotPartition> hot_partition_;
   std::shared_ptr<HotPartition> warm_partition_;
+  std::shared_ptr<PartitionGCHist> gc_hist_;
 
   // --------------------------------------------------------------------------
 
@@ -537,6 +578,7 @@ class ZonedBlockDevice {
   // Some metrics
   std::shared_ptr<ZenFSMetrics> metrics_;
   std::shared_ptr<XZenFSMetrics> x_metrics_ = std::make_shared<XZenFSMetrics>();
+  uint64_t last_gc_finish_time_ = 0;
 
   // A map recording Blob SST (file number) stored in a specific zone
   // NOTE: Initialized from persistent metadata. We place this struct in zbd
@@ -778,6 +820,9 @@ class ZonedBlockDevice {
   std::pair<zone_id_t, double> PickZoneFromHashPartition(
       uint32_t *partition_id);
 
+  std::pair<zone_id_t, double> MaybeSwitchToAnotherPartition(
+      uint32_t partition, uint32_t *choose_partition);
+
   std::unordered_set<uint64_t> GetFilesFromZone(zone_id_t zone_id);
 
   // ===========================================================
@@ -803,7 +848,7 @@ class ZonedBlockDevice {
   }
 
   bool IsValueSSTZone(const Zone *zone) {
-    return zone->ZoneId() >= 9 && zone->ZoneId() <= 95;
+    return zone->ZoneId() >= 9 && zone->ZoneId() <= 99;
     return false;
   }
 

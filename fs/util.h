@@ -5,6 +5,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <chrono>
 
 //
 // This iterator provides the functionality of enumerating all possible
@@ -59,4 +60,3 @@ inline uint64_t round_up_align(uint64_t d, uint64_t align) {
 inline uint64_t round_down_align(uint64_t d, uint64_t align) {
   return d / align * align;
 }
-
