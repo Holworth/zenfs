@@ -202,7 +202,6 @@ struct ZenFSMetricsLatencyGuard {
 
 // ====================================================================
 //  Our own metrics and related structs
-//
 // ====================================================================
 
 enum XZenFSMetricsType : uint32_t {
